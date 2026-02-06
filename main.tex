@@ -16,7 +16,6 @@
 \usepackage{graphicx} % For including images
 \usepackage{hyperref}
 \usepackage{pdfpages} % For including external PDFs
-\usepackage{hyperref}
 \usepackage{url}
 \usepackage{natbib}
 \usepackage{fontawesome}
@@ -144,18 +143,15 @@ where $W_T^{(x+\pi,\xi)}$ is the investor’s terminal wealth if they start with
 
 This methodology yields a \text{personalized price} that depends on the utility function $U(\cdot)$ and the investor’s initial capital $x$. It naturally generates a bid–ask spread: the \text{ask price} (seller’s indifference price) is typically higher than the \text{bid price} (buyer’s indifference price) because the two parties face opposite risk exposures. 
 
-Utility-based prices correspond to selecting a particular equivalent martingale measure (EMM) among many, depending on the investor’s preferences. Under regularity conditions, the \text{marginal utility pricing measure} the measure under which the investor is indifferent to an infinitesimal trade minimizes a divergence to the physical measure, reflecting a form of convex duality. For example, with exponential utility $U(w) = -e^{-\gamma w}$, the indifference price selects the \text{minimal entropy martingale measure} as shown by \cite{Frittelli2000}. More generally, \cite{HugonnierKramkovSchachermayer2005} proved that if an EMM maximizes the investor’s dual utility, then all bounded claims have unique utility based prices under that measure, which effectively renders the market complete from the investor’s perspective.
+Utility-based prices correspond to selecting a particular equivalent martingale measure (EMM) among many, depending on the investor's preferences. Under regularity conditions, the \text{marginal utility pricing measure} the measure under which the investor is indifferent to an infinitesimal trade minimizes a divergence to the physical measure, reflecting a form of convex duality. For example, with exponential utility $U(w) = -e^{-\gamma w}$, the indifference price selects the \text{minimal entropy martingale measure} as shown by \citep{Frittelli2000}. More generally, \citep{HugonnierKramkovSchachermayer2005} proved that if an EMM maximizes the investor's dual utility, then all bounded claims have unique utility based prices under that measure, which effectively renders the market complete from the investor's perspective.
 
 In incomplete markets, this pricing rule becomes nonlinear: the price depends on the claim $\xi$ in a nonlinear way. Utility-based pricing thus preserves arbitrage bounds but selects a unique price in the interval by incorporating \text{risk aversion}. The resulting hedging strategy only \text{partially hedges} the claim, balancing risk tolerance and cost.
 
-Utility-indifference pricing methods have been extended to a variety of utility forms (CRRA, HARA, etc.) and linked to \text{convex risk measures}. Notably, \citep{FollmerSchied2002} introduced convex risk measures such as entropic risk and CVaR that offer pricing bounds and dual interpretations via utility or optimization problems. These methods relax the requirement for a fully specified utility function and instead impose convexity and monotonicity conditions on the “risk price functional.”
+Utility-indifference pricing methods have been extended to a variety of utility forms (CRRA, HARA, etc.) and linked to \text{convex risk measures}. Notably, \cite{FollmerSchied2002} introduced convex risk measures such as entropic risk and CVaR that offer pricing bounds and dual interpretations via utility or optimization problems. These methods relax the requirement for a fully specified utility function and instead impose convexity and monotonicity conditions on the "risk price functional."
 
-\subsection{Reflected Backward Stochastic Differential Equations(RBSDEs) and Optimal Stopping for American Options}
+\subsection{Reflected Backward Stochastic Differential Equations (RBSDEs) and Optimal Stopping for American Options}
 
-American options introduce an additional layer of complexity: the holder can excercise early at any stopping time $\tau$ prior to maturity. Valuing American claims requires solving an optimal stopping problem. In a complete-market setting(or under a chosen pricing measure $Q$ in an incomplete market), the arbitrage-free price process $Y_t$ of an American option is given by the Snell envelope of its payoff process. That is, $$Y_t := \esssup_{\tau \ge t} \mathbb{E}^Q[\xi_{\tau} \mid \mathcal{F}_t]$$, where ${\xi}_{\tau}$ is the payoff reveived if excercise happens at $\tau$. The Snell envelope is the smallest supermartingale dominating the payoff process $\xi_t$, and it can be shown to equal the value of an optimal stopping rule (there exists an optimal stopping time $\tau^*$ attaining the essential supremum) \cite{Shiryaev2006}.
-
-
-
+American options introduce an additional layer of complexity: the holder can exercise early at any stopping time $\tau$ prior to maturity. Valuing American claims requires solving an optimal stopping problem. In a complete-market setting (or under a chosen pricing measure $Q$ in an incomplete market), the arbitrage-free price process $Y_t$ of an American option is given by the Snell envelope of its payoff process. That is, $$Y_t := \esssup_{\tau \ge t} \mathbb{E}^Q[\xi_{\tau} \mid \mathcal{F}_t]$$, where ${\xi}_{\tau}$ is the payoff received if exercise happens at $\tau$. The Snell envelope is the smallest supermartingale dominating the payoff process $\xi_t$, and it can be shown to equal the value of an optimal stopping rule (there exists an optimal stopping time $\tau^*$ attaining the essential supremum) \cite{Shiryaev2006}.
 
 
 
