@@ -85,8 +85,6 @@
 \section*{Chapter 1}
 \section{Introduction}
 
-This thesis explores hedging strategies and pricing methodologies in incomplete financial markets, with a focus on optimal stopping problems for American-style derivatives. We examine both classical approaches and modern machine learning techniques for computing hedging strategies and option values.
-
 \clearpage
 \section*{Chapter 2}
 \section{Literature Review}
@@ -153,7 +151,7 @@ Utility-indifference pricing methods have been extended to a variety of utility 
 
 \subsection{Reflected Backward Stochastic Differential Equations (RBSDEs) and Optimal Stopping for American Options}
 
-American options introduce an additional layer of complexity: the holder can exercise early at any stopping time $\tau$ prior to maturity. Valuing American claims requires solving an optimal stopping problem. In a complete-market setting (or under a chosen pricing measure $Q$ in an incomplete market), the arbitrage-free price process $Y_t$ of an American option is given by the Snell envelope of its payoff process. That is, $$Y_t := \esssup_{\tau \ge t} \mathbb{E}^Q[\xi_{\tau} \mid \mathcal{F}_t]$$, where ${\xi}_{\tau}$ is the payoff received if exercise happens at $\tau$. The Snell envelope is the smallest supermartingale dominating the payoff process $\xi_t$, and it can be shown to equal the value of an optimal stopping rule (there exists an optimal stopping time $\tau^*$ attaining the essential supremum) \cite{Shiryaev2006}
+American options introduce an additional layer of complexity: the holder can exercise early at any stopping time $\tau$ prior to maturity. Valuing American claims requires solving an optimal stopping problem. In a complete-market setting (or under a chosen pricing measure $Q$ in an incomplete market), the arbitrage-free price process $Y_t$ of an American option is given by the Snell envelope of its payoff process. That is, $$Y_t := \esssup_{\tau \ge t} \mathbb{E}^Q[\xi_{\tau} \mid \mathcal{F}_t]$$, where ${\xi}_{\tau}$ is the payoff received if exercise happens at $\tau$. The Snell envelope is the smallest supermartingale dominating the payoff process $\xi_t$, and it can be shown to equal the value of an optimal stopping rule (there exists an optimal stopping time $\tau^*$ attaining the essential supremum) \cite{Shiryaev2006}. In more Intuitive terms, at any time $t$, the fair price equals the maximal continuation value, the best expected payoff achieve by stopping at some optinal future time. If immediate excerccise yields more than the continuation value, it is optimal to exercise l otherwise, hold the option. This condition leads to the classical free-boundary problem in PDE formmulationa (e.g. the moving boundary in the Black-Sholes PDE for an American put option).
 
 
 
