@@ -22,10 +22,14 @@ Thumbs.db
 *.blg
 
 # IDE/Editor files
-.vscode/
 .idea/
 *.sublime-project
 *.sublime-workspace
+
+# VS Code - allow project settings but ignore user preferences
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
 
 # Temporary files
 *.tmp
