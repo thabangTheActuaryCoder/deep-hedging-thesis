@@ -1,0 +1,179 @@
+\documentclass[12pt]{article}
+
+\usepackage{geometry}
+\geometry{
+    a4paper,
+    left=25mm,
+    right=25mm,
+    top=25mm,
+    bottom=25mm,
+}
+
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{setspace}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{graphicx} % For including images
+\usepackage{hyperref}
+\usepackage{pdfpages} % For including external PDFs
+\usepackage{url}
+\usepackage{natbib}
+\usepackage{fontawesome}
+
+
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+\numberwithin{equation}{subsection}
+\onehalfspacing
+\DeclareMathOperator*{\esssup}{ess\,sup}
+
+% =============================================================
+% Header and Footer (dynamic section/subsection titles)
+% =============================================================
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% Update marks for section and subsection titles
+\renewcommand{\sectionmark}[1]{\markboth{\thesection\quad #1}{}}
+\renewcommand{\subsectionmark}[1]{\markright{\thesubsection\quad #1}}
+
+% Header: show subsection if available, else section; page number on right
+\fancyhead[L]{\nouppercase{\ifx\rightmark\empty\leftmark\else\rightmark\fi}}
+\fancyhead[R]{\thepage}
+
+% =============================================================
+% Title Formatting
+% =============================================================
+\titleformat{\section}
+  {\normalfont\Large\bfseries}{\thesection}{1em}{}
+
+\titleformat{\subsection}
+  {\normalfont\large\bfseries}{\thesubsection}{1em}{}
+
+\begin{document}
+
+% =============================================================
+% Include the external cover page PDF
+% =============================================================
+\includepdf[pages=-]{MSc MS cover page.pdf}
+
+% ============================
+% List of Figures
+% ============================
+\newpage
+\markboth{List of Figures}{}
+\listoffigures
+
+% ============================
+% List of Tables
+% ============================
+\newpage
+\markboth{List of Tables}{}
+\listoftables
+
+% ============================
+% Table of Contents
+% ============================
+\newpage
+\markboth{Table of Contents}{}
+\tableofcontents
+
+\clearpage
+\section*{Chapter 1}
+\section{Introduction}
+
+\clearpage
+\section*{Chapter 2}
+\section{Literature Review}
+\subsection{Incomplete Markets and Classical Replication Theory}
+
+In a complete market (e.g., the Black--Scholes model), every contingent claim can be perfectly replicated by a self-financing portfolio, leading to a unique arbitrage-free price via the \text{law of one price}. Classic works by \cite{BlackScholes1973} and \cite{Merton1973} solved option pricing through PDEs and replication, while \cite{HarrisonPliska1981} recast pricing in probabilistic terms, showing that completeness is equivalent to a unique martingale measure for pricing.
+
+
+In stark contrast, an \text{incomplete market} lacks enough traded instruments to hedge all risks, so contingent claims are generally not replicable. As a result, arbitrage arguments alone yield a \text{range} (interval) of acceptable prices rather than a unique price. The endpoints of this interval correspond to extreme assumptions, the lowest price corresponds to taking on all risk (no hedge) and the highest to eliminating all risk (full hedge) and any price in between is arbitrage-free but entails residual risk. Unless a claim is replicable (in which case the interval collapses to a point), additional criteria are needed to select a single ``fair'' price from this interval. In practice, this selection depends on the agent’s risk preferences or other optimality principles. Thus, incomplete markets force a departure from pure arbitrage pricing toward \text{preference-based} or \text{risk-based} pricing frameworks.
+
+Early fundamental theorems of asset pricing formalized these ideas. \cite{HarrisonKreps1979} and \cite{DalangMortonWillinger1990} showed that absence of arbitrage is equivalent to the existence of at least one \text{equivalent martingale measure} (EMM) under which discounted asset prices are martingales. In incomplete markets there are infinitely many such measures, leading to non-uniqueness in pricing. Hedgers then face \text{residual risk}: any chosen strategy leaves some profit-and-loss uncertainty. A baseline goal is often to minimize or manage this residual risk.
+
+
+For example, one can project the claim’s payoff onto the span of attainable payoff profiles this is the idea behind \text{mean-variance hedging} and other risk-minimization approaches. Such approaches, introduced by \cite{FollmerSondermann1986} and \cite{DuffieRichardson1991}, choose an EMM that makes the hedging error orthogonal (in an $\mathcal{L}^2$ sense) to the trading strategies. The resulting quadratic optimization yields a \text{mean-variance optimal} price and strategy. This \text{martingale representation} approach balances hedging accuracy against variance of the payoff, effectively penalizing under- and over-hedging symmetrically.
+
+
+As \cite{Schweizer1999} and others detail, mean-variance hedging can be formulated via \text{local risk-minimization} or global variance minimization, each leading to tractable formulas under certain models. These classical methods illustrate how \text{convex duality} and \text{stochastic control} ideas permeate incomplete-market hedging: one optimizes a convex criterion (variance, utility, etc.) subject to the dynamics of the wealth process, often solving a stochastic control problem to find the optimal strategy.
+
+\subsection{Superhedging, Optional Decomposition, and Utility-Based Pricing}
+
+One extreme approach to hedging in incomplete markets is \text{superhedging}. The superhedging price of a claim is the minimum initial capital required to construct a self-financing strategy that dominates the claim’s payoff in all scenarios that is, the terminal portfolio value is almost surely greater than or equal to the payoff. This ensures there is no risk of loss: the claim is fully hedged under all contingencies.
+
+Classic duality results link the superhedging price to martingale measures. Specifically, it equals the supremum of $\mathbb{E}^Q[\xi]$ over all equivalent martingale measures (EMMs) $Q$ compatible with market prices in discrete time, or over an appropriate closure of such measures in continuous time \cite{DelbaenSchachermayer2006}. In other words, charging the superhedging price guarantees that the seller can meet the payoff with certainty, even under the worst-case equivalent measure.
+
+The seminal work of El Karoui and Quenez \cite{ElKarouiQuenez1995}, along with the optional decomposition theorem of Kramkov \cite{Kramkov1996}, provides the theoretical foundation for this approach. Optional decomposition generalizes the Doob--Meyer decomposition to optional (i.e., adapted) increasing processes. It states that if a c\`adl\`ag process $V_t$ is a supermartingale under every martingale measure $Q$ in a broad class, then $V$ can be expressed as
+\[
+V_t = V_0 + \int_0^t \xi_s \, dX_s - C_t,
+\]
+where $X_s$ is the price process, $\xi_s$ is a predictable trading strategy, and $C_t$ is an adapted, c\`adl\`ag, non-decreasing process. Intuitively, the stochastic integral $\xi \cdot X$ represents gains from trade the hedging portfolio while $C_t$ accounts for capital injections or costs required to maintain the superhedging, ensuring that the portfolio value $V_t$ never falls below the claim’s payoff.
+
+This decomposition enables the explicit construction of a superhedging strategy: one begins with initial capital $V_0$ equal to the superhedging price, dynamically allocates wealth according to $\xi$, and adjusts through $dC_t$ to ensure that the wealth process $V_t$ always satisfies
+\[
+V_t \geq \xi_t, \quad \text{almost surely for all } t \in [0, T].
+\]
+Kramkov’s theorem guarantees the existence of such a strategy for any contingent claim whose market price does not fall below its superhedging cost \cite{Kramkov1996}.
+
+In essence, superhedging reframes the pricing problem into the construction of a martingale-super-replicating strategy. The optional decomposition simultaneously yields both the hedging policy $\xi$ and the consumption process $C_t$ needed to bridge any hedging shortfall.
+
+Although superhedging eliminates risk, it is notoriously expensive and often impractical. The superhedging price can be significantly higher than typical market prices, especially when the claim’s risks are largely unhedgeable. Superhedging is also \text{overly conservative}, as it assumes that nature adversarially selects the worst-case scenario. This leads to two main drawbacks. First, the strategy typically requires holding large protective positions or cash, severely limiting potential upside an opportunity cost. Second, the initial capital needed to eliminate all risk is often too high for competitive trading.
+
+Early research acknowledged these limitations (see, \cite{FoellmerLeukert1999}) and proposed more efficient approaches. One such method is \text{quantile hedging} \cite{FoellmerLeukert1999}, which relaxes the requirement of almost-sure coverage to high-probability coverage typically at least $1 - \varepsilon$. By tolerating a small shortfall probability $\varepsilon$, one can reduce the initial capital requirement substantially. Quantile hedging formalizes a trade-off between the success probability and initial cost, effectively generalizing Value-at-Risk to dynamic trading settings.
+
+Föllmer and Leukert demonstrated that solving the quantile hedging problem is equivalent to a certain dual optimization over \text{subsets} of paths and measures. As $\varepsilon \to 0$, the required capital converges to the superhedging price. They further showed that the $\alpha$-quantile hedging price converges to the superhedging price as $\alpha \rightarrow 1$.
+
+Recent research has even applied neural networks to compute quantile hedges and their associated success probabilities, confirming that as the confidence level approaches 100\%, the resulting strategy converges to the superhedging solution.
+
+At the other extreme, an agent might ignore hedging and simply charge a \text{subjective price}, bearing all risk. Any price between the subhedging (minimal) and superhedging (maximal) price is arbitrage-free but exposes the agent to a non-zero probability of loss at expiration. 
+
+\text{Utility-based pricing} (or indifference pricing) provides a principled way to choose such a price by optimizing the trade-off between profit and risk. This approach was introduced by \cite{HodgesNeuberger1989} and further developed by \cite{Davis1997}, \cite{FollmerSondermann1986}, and others. It embeds the pricing problem into the investor’s \text{expected utility maximization} framework. 
+
+The \emph{indifference price} $\pi$ for a claim $\xi$ is defined implicitly via:
+\[
+\mathbb{E}\left[U(W_T^{(x+\pi,\xi)})\right] = \mathbb{E}\left[U(W_T^{(x,0)})\right],
+\]
+where $W_T^{(x+\pi,\xi)}$ is the investor’s terminal wealth if they start with initial capital $x$, pay $\pi$, and receive the claim $\xi$ (and trade optimally), and $W_T^{(x,0)}$ is the terminal wealth without purchasing the claim. In essence, $\pi$ is the amount that makes the investor indifferent (in expected utility terms) between selling the claim or not.
+
+This methodology yields a \text{personalized price} that depends on the utility function $U(\cdot)$ and the investor’s initial capital $x$. It naturally generates a bid–ask spread: the \text{ask price} (seller’s indifference price) is typically higher than the \text{bid price} (buyer’s indifference price) because the two parties face opposite risk exposures. 
+
+Utility-based prices correspond to selecting a particular equivalent martingale measure (EMM) among many, depending on the investor's preferences. Under regularity conditions, the \text{marginal utility pricing measure} the measure under which the investor is indifferent to an infinitesimal trade minimizes a divergence to the physical measure, reflecting a form of convex duality. For example, with exponential utility $U(w) = -e^{-\gamma w}$, the indifference price selects the \text{minimal entropy martingale measure} as shown by \citep{Frittelli2000}. More generally, \citep{HugonnierKramkovSchachermayer2005} proved that if an EMM maximizes the investor's dual utility, then all bounded claims have unique utility based prices under that measure, which effectively renders the market complete from the investor's perspective.
+
+In incomplete markets, this pricing rule becomes nonlinear: the price depends on the claim $\xi$ in a nonlinear way. Utility-based pricing thus preserves arbitrage bounds but selects a unique price in the interval by incorporating \text{risk aversion}. The resulting hedging strategy only \text{partially hedges} the claim, balancing risk tolerance and cost.
+
+Utility-indifference pricing methods have been extended to a variety of utility forms (CRRA, HARA, etc.) and linked to \text{convex risk measures}. Notably, \cite{FollmerSchied2002} introduced convex risk measures such as entropic risk and CVaR that offer pricing bounds and dual interpretations via utility or optimization problems. These methods relax the requirement for a fully specified utility function and instead impose convexity and monotonicity conditions on the "risk price functional."
+
+\subsection{Reflected Backward Stochastic Differential Equations (RBSDEs) and Optimal Stopping for American Options}
+
+American options introduce an additional layer of complexity: the holder can exercise early at any stopping time $\tau$ prior to maturity. Valuing American claims requires solving an optimal stopping problem. In a complete-market setting (or under a chosen pricing measure $Q$ in an incomplete market), the arbitrage-free price process $Y_t$ of an American option is given by the Snell envelope of its payoff process. That is, $$Y_t := \esssup_{\tau \ge t} \mathbb{E}^Q[\xi_{\tau} \mid \mathcal{F}_t]$$, where ${\xi}_{\tau}$ is the payoff received if exercise happens at $\tau$. The Snell envelope is the smallest supermartingale dominating the payoff process $\xi_t$, and it can be shown to equal the value of an optimal stopping rule (there exists an optimal stopping time $\tau^*$ attaining the essential supremum) \cite{Shiryaev2006}.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\newpage
+
+\bibliographystyle{agsm}
+\bibliography{References}
+
+
+
+\end{document}
