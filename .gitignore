@@ -1,9 +1,11 @@
 # Ignore all files by default
 /*
 
-# ONLY commit source files
+# ONLY commit source and important files
 !main.tex
 !References.bib
+!main.pdf
+!Figures/
 
 # Keep config and metadata
 !.gitignore
@@ -11,9 +13,6 @@
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json
-
-# Keep figures if they're source images (otherwise ignore)
-# Uncomment if needed: !Figures/
 
 # Keep documentation
 # !README.md
