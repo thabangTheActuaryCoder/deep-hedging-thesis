@@ -225,7 +225,8 @@ def plot_substeps_convergence(substeps_results, output_dir="outputs/plots"):
     plt.close(fig)
 
 
-def plot_summary_table(all_metrics, output_dir="outputs/plots"):
+def plot_summary_table(all_metrics, output_dir="outputs/plots",
+                       title="Model Comparison (Validation Set)"):
     """Generate a summary comparison table as an image."""
     ensure_dir(output_dir)
     models = list(all_metrics.keys())
@@ -250,7 +251,145 @@ def plot_summary_table(all_metrics, output_dir="outputs/plots"):
     table.auto_set_font_size(False)
     table.set_fontsize(9)
     table.scale(1.2, 1.4)
-    ax.set_title("Model Comparison (Test Set)", fontsize=12, pad=20)
+    ax.set_title(title, fontsize=12, pad=20)
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "summary_table.png"), dpi=150)
+    plt.close(fig)
+
+
+def plot_model_comparison_bars(all_agg, output_dir="outputs/plots_val"):
+    """Grouped bar chart comparing CVaR95, MSE, MAE, mean_shortfall across models."""
+    ensure_dir(output_dir)
+    models = list(all_agg.keys())
+    metric_names = ["CVaR95_shortfall", "MSE", "MAE", "mean_shortfall"]
+    labels = ["CVaR95", "MSE", "MAE", "Mean Shortfall"]
+
+    x = np.arange(len(metric_names))
+    width = 0.8 / len(models)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for i, model in enumerate(models):
+        means = []
+        stds = []
+        for mn in metric_names:
+            entry = all_agg[model].get(mn, {})
+            if isinstance(entry, dict):
+                means.append(entry.get("mean", 0))
+                stds.append(entry.get("std", 0))
+            else:
+                means.append(entry)
+                stds.append(0)
+        offset = (i - (len(models) - 1) / 2) * width
+        ax.bar(x + offset, means, width, yerr=stds, label=model,
+               capsize=3, alpha=0.85)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Value")
+    ax.set_title("Model Comparison (Validation Set)")
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "model_comparison_bars.png"), dpi=150)
+    plt.close(fig)
+
+
+def plot_model_comparison_errors(model_errors_dict, output_dir="outputs/plots_val"):
+    """Overlay terminal error histograms for all models on one plot.
+
+    Args:
+        model_errors_dict: {model_name: np.array of terminal errors}
+    """
+    ensure_dir(output_dir)
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for model_name, errors in model_errors_dict.items():
+        ax.hist(errors, bins=60, density=True, alpha=0.4, label=model_name)
+        ax.axvline(np.mean(errors), linestyle="--", alpha=0.7,
+                   label=f"{model_name} mean={np.mean(errors):.4f}")
+
+    ax.set_xlabel("Terminal Error $e_T$")
+    ax.set_ylabel("Density")
+    ax.set_title("Terminal Error Distribution (Validation Set)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "model_comparison_errors.png"), dpi=150)
+    plt.close(fig)
+
+
+def plot_model_comparison_cvar(model_VT_dict, model_H_dict,
+                               output_dir="outputs/plots_val"):
+    """Overlay CVaR curves (q=0.80..0.99) for all models on one plot.
+
+    Args:
+        model_VT_dict: {model_name: V_T tensor}
+        model_H_dict:  {model_name: H_tilde tensor}
+    """
+    ensure_dir(output_dir)
+    qs = np.linspace(0.80, 0.99, 20)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for model_name in model_VT_dict:
+        V_T = model_VT_dict[model_name]
+        H = model_H_dict[model_name]
+        s = shortfall(V_T, H)
+        cvars = [cvar(s, q=q).item() for q in qs]
+        ax.plot(qs, cvars, "o-", linewidth=1.5, markersize=3, label=model_name)
+
+    for q_mark in [0.90, 0.95, 0.99]:
+        ax.axvline(q_mark, color="gray", linestyle=":", alpha=0.4)
+
+    ax.set_xlabel("Quantile $q$")
+    ax.set_ylabel("CVaR$_q$(shortfall)")
+    ax.set_title("CVaR Curve Comparison (Validation Set)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "model_comparison_cvar.png"), dpi=150)
+    plt.close(fig)
+
+
+def plot_validation_summary(all_agg, best_model, output_dir="outputs/plots_val"):
+    """Summary table with best model row highlighted in green.
+
+    Args:
+        all_agg: {model_name: aggregated metrics dict}
+        best_model: str, name of best model to highlight
+    """
+    ensure_dir(output_dir)
+    models = list(all_agg.keys())
+    metric_names = ["MAE", "MSE", "R2", "mean_shortfall",
+                    "CVaR95_shortfall", "P_negative_error"]
+
+    cell_text = []
+    for model in models:
+        row = []
+        m = all_agg[model]
+        for mn in metric_names:
+            if isinstance(m.get(mn), dict):
+                row.append(f"{m[mn]['mean']:.4f} +/- {m[mn]['std']:.4f}")
+            else:
+                row.append(f"{m.get(mn, 0):.4f}")
+        cell_text.append(row)
+
+    fig, ax = plt.subplots(figsize=(14, 2 + len(models) * 0.5))
+    ax.axis("off")
+    table = ax.table(cellText=cell_text, rowLabels=models,
+                     colLabels=metric_names, loc="center", cellLoc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.2, 1.4)
+
+    # Highlight best model row in green
+    for i, model in enumerate(models):
+        if model == best_model:
+            for j in range(len(metric_names) + 1):  # +1 for row label
+                cell = table[i + 1, j - 1] if j > 0 else table[i + 1, -1]
+                cell.set_facecolor("#c8e6c9")
+
+    ax.set_title(f"Validation Summary (best: {best_model})", fontsize=12, pad=20)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "validation_summary.png"), dpi=150)
     plt.close(fig)

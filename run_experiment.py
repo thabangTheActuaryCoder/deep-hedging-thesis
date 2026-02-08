@@ -39,6 +39,8 @@ from src.eval.metrics import compute_metrics, aggregate_seed_metrics, select_rep
 from src.eval.portfolio import simulate_portfolio_path, simulate_bsde_portfolio
 from src.eval.plots import (
     generate_all_plots, plot_substeps_convergence, plot_summary_table,
+    plot_model_comparison_bars, plot_model_comparison_errors,
+    plot_model_comparison_cvar, plot_validation_summary,
 )
 from src.eval.plots_3d import generate_3d_plots, generate_bsde_3d_plots
 
@@ -336,19 +338,23 @@ def run_optuna_search(model_class, feat_dim, d_traded, m_brownian, sigma,
 # ──────────────────────────────────────────────
 
 def run_seed_robustness(model_class, best_config, feat_dim, d_traded, m_brownian,
-                        sigma, train_data, val_data, test_data, args, device,
-                        S_tilde_test, Z_test, time_grid=None, dW_test=None):
-    """Train best config across multiple seeds and aggregate metrics.
+                        sigma, train_data, val_data, args, device,
+                        S_tilde_val, Z_val, time_grid=None, dW_val=None):
+    """Train best config across multiple seeds and evaluate on validation set.
 
     Returns:
         seed_results: list of per-seed results
-        agg_metrics: aggregated test metrics
+        agg_metrics: aggregated validation metrics
+        comparison_data: dict with V_T, H_tilde, errors per representative seed
     """
     depth = best_config["depth"]
     width = best_config["width"]
     act = best_config["act_schedule"]
     lr = best_config["lr"]
     seed_results = []
+    # Track V_T and H_tilde per seed for comparison plots (keep last seed)
+    last_VT = None
+    last_H = None
 
     print(f"\n  Seed robustness for {model_class}: seeds={args.seeds}")
 
@@ -377,12 +383,9 @@ def run_seed_robustness(model_class, best_config, feat_dim, d_traded, m_brownian
                 nn1, ctrl, train_data, val_data, train_cfg, device
             )
 
-            # Evaluate on val and test
-            val_metrics = _eval_hedger_metrics(
-                nn1, ctrl, val_data, bool(args.use_controller), args.cvar_q
-            )
-            test_metrics = _eval_hedger_full(
-                nn1, ctrl, test_data, S_tilde_test, Z_test,
+            # Evaluate on validation set (full metrics with paths)
+            val_metrics = _eval_hedger_full(
+                nn1, ctrl, val_data, Z_val,
                 bool(args.use_controller), args.cvar_q
             )
 
@@ -394,21 +397,24 @@ def run_seed_robustness(model_class, best_config, feat_dim, d_traded, m_brownian
                 state["controller"] = ctrl.state_dict()
             save_checkpoint(state, ckpt_path)
 
-            # Plots
+            # Plots on validation data
             with torch.no_grad():
                 V_T, info = forward_portfolio(
-                    nn1, ctrl, test_data["features"],
-                    test_data["Z_intrinsic"], test_data["dS"],
+                    nn1, ctrl, val_data["features"],
+                    val_data["Z_intrinsic"], val_data["dS"],
                     use_controller=bool(args.use_controller), tbptt=0,
                 )
                 V_path = info["V_path"]
 
             generate_all_plots(
-                model_class, seed, V_T.cpu(), test_data["H_tilde"].cpu(),
-                V_path.cpu(), Z_test.cpu(),
+                model_class, seed, V_T.cpu(), val_data["H_tilde"].cpu(),
+                V_path.cpu(), Z_val.cpu(),
                 t_losses, v_losses,
-                output_dir=os.path.join(args.output_dir, "plots"),
+                output_dir=os.path.join(args.output_dir, "plots_val"),
             )
+
+            last_VT = V_T.cpu()
+            last_H = val_data["H_tilde"].cpu()
 
             # 3D plots for representative seed
             if seed == args.seeds[0]:
@@ -426,12 +432,9 @@ def run_seed_robustness(model_class, best_config, feat_dim, d_traded, m_brownian
                 model, train_data, val_data, train_cfg, device
             )
 
-            # Evaluate
-            val_metrics = _eval_bsde_metrics(
-                model, val_data, time_grid, args.cvar_q, device
-            )
-            test_metrics = _eval_bsde_full(
-                model, test_data, S_tilde_test, Z_test, time_grid,
+            # Evaluate on validation set (full metrics with paths)
+            val_metrics = _eval_bsde_full(
+                model, val_data, S_tilde_val, Z_val, time_grid,
                 args.cvar_q, device
             )
 
@@ -439,21 +442,24 @@ def run_seed_robustness(model_class, best_config, feat_dim, d_traded, m_brownian
                                      f"{model_class}_seed{seed}.pt")
             save_checkpoint(model.state_dict(), ckpt_path)
 
-            # Plots
+            # Plots on validation data
             with torch.no_grad():
                 V_path_h, Y_path, Delta_all = simulate_bsde_portfolio(
-                    model, test_data["features"].to(device),
-                    S_tilde_test.to(device), dW_test.to(device),
+                    model, val_data["features"].to(device),
+                    S_tilde_val.to(device), dW_val.to(device),
                     time_grid.to(device),
                 )
                 V_T = V_path_h[:, -1]
 
             generate_all_plots(
-                model_class, seed, V_T.cpu(), test_data["H_tilde"].cpu(),
-                V_path_h.cpu(), Z_test.cpu(),
+                model_class, seed, V_T.cpu(), val_data["H_tilde"].cpu(),
+                V_path_h.cpu(), Z_val.cpu(),
                 t_losses, v_losses,
-                output_dir=os.path.join(args.output_dir, "plots"),
+                output_dir=os.path.join(args.output_dir, "plots_val"),
             )
+
+            last_VT = V_T.cpu()
+            last_H = val_data["H_tilde"].cpu()
 
             if seed == args.seeds[0]:
                 generate_bsde_3d_plots(
@@ -462,43 +468,35 @@ def run_seed_robustness(model_class, best_config, feat_dim, d_traded, m_brownian
                     output_dir=os.path.join(args.output_dir, "plots_3d"),
                 )
 
-        print(f"CVaR95(test)={test_metrics['CVaR95_shortfall']:.6f}")
+        print(f"CVaR95(val)={val_metrics['CVaR95_shortfall']:.6f}")
 
         seed_results.append({
             "seed": seed,
             "val_metrics": val_metrics,
-            "test_metrics": test_metrics,
             "train_losses": t_losses,
             "val_losses": v_losses,
         })
 
-    # Aggregate
-    test_metrics_list = [r["test_metrics"] for r in seed_results]
-    agg = aggregate_seed_metrics(test_metrics_list)
+    # Aggregate on validation metrics
+    val_metrics_list = [r["val_metrics"] for r in seed_results]
+    agg = aggregate_seed_metrics(val_metrics_list)
     rep_seed = select_representative_seed(seed_results)
     agg["representative_seed"] = rep_seed
 
-    return seed_results, agg
+    # Comparison data: V_T and H from representative (last) seed
+    comparison_data = {
+        "V_T": last_VT,
+        "H_tilde": last_H,
+    }
+
+    return seed_results, agg, comparison_data
 
 
 # ──────────────────────────────────────────────
 # Evaluation helpers
 # ──────────────────────────────────────────────
 
-def _eval_hedger_metrics(nn1, ctrl, data, use_ctrl, cvar_q):
-    """Quick eval returning key metrics dict."""
-    nn1.eval()
-    if ctrl is not None:
-        ctrl.eval()
-    with torch.no_grad():
-        V_T, _ = forward_portfolio(
-            nn1, ctrl, data["features"], data["Z_intrinsic"],
-            data["dS"], use_controller=use_ctrl, tbptt=0,
-        )
-    return compute_metrics(V_T, data["H_tilde"], cvar_q=cvar_q)
-
-
-def _eval_hedger_full(nn1, ctrl, data, S_tilde_test, Z_test, use_ctrl, cvar_q):
+def _eval_hedger_full(nn1, ctrl, data, Z_split, use_ctrl, cvar_q):
     """Full eval with path-level metrics."""
     nn1.eval()
     if ctrl is not None:
@@ -510,30 +508,22 @@ def _eval_hedger_full(nn1, ctrl, data, S_tilde_test, Z_test, use_ctrl, cvar_q):
         )
         V_path = info["V_path"]
     return compute_metrics(V_T, data["H_tilde"], V_path=V_path,
-                           Z_intrinsic=Z_test[:, :V_path.shape[1]].to(V_path.device),
+                           Z_intrinsic=Z_split[:, :V_path.shape[1]].to(V_path.device),
                            cvar_q=cvar_q)
 
 
-def _eval_bsde_metrics(model, data, time_grid, cvar_q, device):
-    """Quick BSDE eval."""
-    model.eval()
-    with torch.no_grad():
-        Y_T, _, _ = model(data["features"], data["dW"], time_grid.to(device))
-    return compute_metrics(Y_T, data["H_tilde"], cvar_q=cvar_q)
-
-
-def _eval_bsde_full(model, data, S_tilde_test, Z_test, time_grid, cvar_q, device):
+def _eval_bsde_full(model, data, S_tilde_split, Z_split, time_grid, cvar_q, device):
     """Full BSDE eval with portfolio path."""
     model.eval()
     with torch.no_grad():
-        V_path, Y_path, _ = simulate_bsde_portfolio(
-            model, data["features"].to(device), S_tilde_test.to(device),
+        V_path, _, _ = simulate_bsde_portfolio(
+            model, data["features"].to(device), S_tilde_split.to(device),
             data["dW"].to(device), time_grid.to(device),
         )
         V_T = V_path[:, -1]
     return compute_metrics(V_T, data["H_tilde"].to(device),
                            V_path=V_path,
-                           Z_intrinsic=Z_test[:, :V_path.shape[1]].to(device),
+                           Z_intrinsic=Z_split[:, :V_path.shape[1]].to(device),
                            cvar_q=cvar_q)
 
 
@@ -602,7 +592,7 @@ def main():
 
     output_dir = "outputs"
     args.output_dir = output_dir
-    for sub in ["plots", "plots_3d", "checkpoints", "run_configs"]:
+    for sub in ["plots", "plots_val", "plots_3d", "checkpoints", "run_configs"]:
         ensure_dir(os.path.join(output_dir, sub))
 
     # ── Step 1: Simulate market ─────────────────
@@ -648,14 +638,12 @@ def main():
     dW_val = dW[val_idx]
     dW_test = dW[test_idx]
 
-    # Prepare data dicts
+    # Prepare data dicts (train + val only; test deferred)
     hedger_train = prepare_hedger_data(features_train, S_tilde_train, Z_train, H_train, device)
     hedger_val = prepare_hedger_data(features_val, S_tilde_val, Z_val, H_val, device)
-    hedger_test = prepare_hedger_data(features_test, S_tilde_test, Z_test, H_test, device)
 
     bsde_train = prepare_bsde_data(features_train, dW_train, H_train, time_grid, device)
     bsde_val = prepare_bsde_data(features_val, dW_val, H_val, time_grid, device)
-    bsde_test = prepare_bsde_data(features_test, dW_test, H_test, time_grid, device)
 
     # Save feature tensors
     data_dir = os.path.join(output_dir, "data")
@@ -722,17 +710,19 @@ def main():
                       stage1_path)
             print(f"  [saved Stage 1 progress: {list(best_configs.keys())}]")
 
-    # ── Step 4: Stage 2 – Seed robustness ───────
-    print("\n=== Step 4: Stage 2 – Seed Robustness ===")
+    # ── Step 4: Stage 2 – Seed robustness (val only) ──
+    print("\n=== Step 4: Stage 2 – Seed Robustness (Validation) ===")
 
     summary_path = os.path.join(output_dir, "metrics_summary.json")
+    val_metrics_path = os.path.join(output_dir, "val_metrics.json")
 
     # Try to load existing Stage 2 results
     all_results = {}
     all_agg = {}
+    all_comparison = {}
     if os.path.exists(summary_path):
         summary_saved = load_json(summary_path)
-        all_agg = summary_saved.get("aggregated_test_metrics", {})
+        all_agg = summary_saved.get("aggregated_val_metrics", {})
 
     stage2_done = all(mc in all_agg for mc in all_models)
     if stage2_done:
@@ -755,32 +745,33 @@ def main():
 
             print(f"\n--- {model_class} ---")
             if model_class in ("FNN", "LSTM"):
-                seed_res, agg = run_seed_robustness(
+                seed_res, agg, comp_data = run_seed_robustness(
                     model_class, best_configs[model_class],
                     feat_dim, args.d_traded, args.m_brownian, sigma,
-                    hedger_train, hedger_val, hedger_test,
+                    hedger_train, hedger_val,
                     args, device,
-                    S_tilde_test=S_tilde_test.to(device),
-                    Z_test=Z_test.to(device),
+                    S_tilde_val=S_tilde_val.to(device),
+                    Z_val=Z_val.to(device),
                 )
             else:
-                seed_res, agg = run_seed_robustness(
+                seed_res, agg, comp_data = run_seed_robustness(
                     model_class, best_configs[model_class],
                     feat_dim, args.d_traded, args.m_brownian, sigma,
-                    bsde_train, bsde_val, bsde_test,
+                    bsde_train, bsde_val,
                     args, device,
-                    S_tilde_test=S_tilde_test.to(device),
-                    Z_test=Z_test.to(device),
+                    S_tilde_val=S_tilde_val.to(device),
+                    Z_val=Z_val.to(device),
                     time_grid=time_grid,
-                    dW_test=dW_test,
+                    dW_val=dW_val,
                 )
             all_results[model_class] = seed_res
             all_agg[model_class] = agg
+            all_comparison[model_class] = comp_data
 
             # Incremental save after each model's seed robustness
             save_json(
                 {"best_configs": best_configs,
-                 "aggregated_test_metrics": {m: all_agg[m] for m in all_agg},
+                 "aggregated_val_metrics": {m: all_agg[m] for m in all_agg},
                  "config": {
                      "paths": args.paths, "N": args.N, "T": args.T,
                      "d_traded": args.d_traded, "m_brownian": args.m_brownian,
@@ -789,11 +780,64 @@ def main():
                  }},
                 summary_path,
             )
-            _write_csv_summary(all_agg, os.path.join(output_dir, "metrics_summary.csv"))
+            _write_csv_summary(all_agg, os.path.join(output_dir, "val_metrics_summary.csv"))
             print(f"  [saved Stage 2 progress: {list(all_agg.keys())}]")
 
-    # ── Step 5: DBSDE substeps study ────────────
-    print("\n=== Step 5: DBSDE Substeps Study ===")
+    # ── Step 5: Validation Analysis ────────────
+    print("\n=== Step 5: Validation Analysis ===")
+
+    plots_val_dir = os.path.join(output_dir, "plots_val")
+
+    # Determine best model (lowest mean CVaR95_shortfall)
+    best_model = min(
+        all_agg.keys(),
+        key=lambda m: (all_agg[m]["CVaR95_shortfall"]["mean"]
+                        if isinstance(all_agg[m].get("CVaR95_shortfall"), dict)
+                        else float("inf")),
+    )
+    print(f"  Best model: {best_model}")
+
+    # Summary table (parameterized title)
+    plot_summary_table(all_agg, output_dir=plots_val_dir,
+                       title="Model Comparison (Validation Set)")
+
+    # Highlighted validation summary
+    plot_validation_summary(all_agg, best_model, output_dir=plots_val_dir)
+
+    # Grouped bar chart
+    plot_model_comparison_bars(all_agg, output_dir=plots_val_dir)
+
+    # Comparison plots require comparison_data (only available if Stage 2 ran fresh)
+    if all_comparison:
+        # Overlay error histograms
+        model_errors_dict = {}
+        model_VT_dict = {}
+        model_H_dict = {}
+        for mc, comp in all_comparison.items():
+            V_T_c = comp["V_T"]
+            H_c = comp["H_tilde"]
+            e = terminal_error(V_T_c, H_c).numpy()
+            model_errors_dict[mc] = e
+            model_VT_dict[mc] = V_T_c
+            model_H_dict[mc] = H_c
+
+        plot_model_comparison_errors(model_errors_dict, output_dir=plots_val_dir)
+        plot_model_comparison_cvar(model_VT_dict, model_H_dict,
+                                   output_dir=plots_val_dir)
+        print("  Generated comparison plots: bars, errors overlay, CVaR overlay")
+    else:
+        print("  Comparison plots skipped (loaded from cache, no tensor data)")
+
+    # Save val_metrics.json
+    save_json(
+        {"aggregated_val_metrics": all_agg, "best_model": best_model},
+        val_metrics_path,
+    )
+    _write_csv_summary(all_agg, os.path.join(output_dir, "val_metrics_summary.csv"))
+    print(f"  Saved val_metrics.json and val_metrics_summary.csv")
+
+    # ── Step 6: DBSDE substeps study ────────────
+    print("\n=== Step 6: DBSDE Substeps Study ===")
 
     # Check if substeps results already exist in saved summary
     sub_results = []
@@ -818,16 +862,14 @@ def main():
         sub_results = []
         print("  Skipped (only 1 substep value).")
 
-    # ── Step 6: Save final outputs ─────────────
-    print("\n=== Step 6: Saving Final Results ===")
-
-    # Summary table plot
-    plot_summary_table(all_agg, output_dir=os.path.join(output_dir, "plots"))
+    # ── Step 7: Save final results (val metrics only) ──
+    print("\n=== Step 7: Saving Final Results ===")
 
     # Final JSON summary (overwrites incremental with substeps added)
     summary = {
         "best_configs": best_configs,
-        "aggregated_test_metrics": {},
+        "aggregated_val_metrics": {},
+        "best_model": best_model,
         "substeps_study": sub_results,
         "config": {
             "paths": args.paths, "N": args.N, "T": args.T,
@@ -837,12 +879,12 @@ def main():
         },
     }
     for mc in all_models:
-        summary["aggregated_test_metrics"][mc] = all_agg[mc]
+        summary["aggregated_val_metrics"][mc] = all_agg[mc]
 
     save_json(summary, summary_path)
 
     # Final CSV
-    _write_csv_summary(all_agg, os.path.join(output_dir, "metrics_summary.csv"))
+    _write_csv_summary(all_agg, os.path.join(output_dir, "val_metrics_summary.csv"))
 
     print("\n=== Done ===")
     print(f"Results saved to {output_dir}/")
