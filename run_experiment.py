@@ -205,7 +205,8 @@ def prepare_bsde_data(features, dW_split, H_split, time_grid, device):
 # ──────────────────────────────────────────────
 
 def run_optuna_search(model_class, feat_dim, d_traded, m_brownian, sigma,
-                      train_data, val_data, args, device, time_grid=None):
+                      train_data, val_data, args, device, time_grid=None,
+                      output_dir=None):
     """Run Optuna TPE search over architecture + LR for one model class.
 
     Search space (categorical, matching spec):
@@ -338,12 +339,38 @@ def run_optuna_search(model_class, feat_dim, d_traded, m_brownian, sigma,
           f"(search space = {total_configs} configs)")
 
     sampler = optuna.samplers.TPESampler(seed=args.seed_arch)
-    study = optuna.create_study(direction="minimize", sampler=sampler,
-                                study_name=f"{model_class}_stage1")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
-    # Select best: primary = CVaR95 (study.best_trial), tie-break = MSE, prefer smaller LR
-    # Re-sort trial_log for the final selection with tie-breaking
+    # Use SQLite storage for checkpoint/resume (survives Colab disconnects)
+    storage = None
+    if output_dir is not None:
+        db_path = os.path.join(output_dir, "run_configs",
+                               f"optuna_{model_class}.db")
+        storage = f"sqlite:///{db_path}"
+
+    study = optuna.create_study(direction="minimize", sampler=sampler,
+                                study_name=f"{model_class}_stage1",
+                                storage=storage, load_if_exists=True)
+
+    done = len([t for t in study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE])
+    remaining = max(0, n_trials - done)
+    if done > 0:
+        print(f"  Resuming: {done}/{n_trials} trials already complete")
+    if remaining > 0:
+        study.optimize(objective, n_trials=remaining, show_progress_bar=False)
+
+    # Rebuild trial_log from all completed study trials (covers resumed + new)
+    trial_log = []
+    for t in study.trials:
+        if t.state == optuna.trial.TrialState.COMPLETE:
+            trial_log.append({
+                "depth": t.params["depth"], "width": t.params["width"],
+                "act_schedule": t.params["act_schedule"], "lr": t.params["lr"],
+                "val_CVaR95": t.value,
+                "val_MSE": t.user_attrs.get("val_MSE", float("inf")),
+            })
+
+    # Select best: primary = CVaR95, tie-break = MSE, prefer smaller LR
     trial_log.sort(key=lambda x: (x["val_CVaR95"], x["val_MSE"], x["lr"]))
     best = trial_log[0]
 
@@ -382,6 +409,24 @@ def run_seed_robustness(model_class, best_config, feat_dim, d_traded, m_brownian
     for seed in args.seeds:
         clear_gpu_cache()
         print(f"\n    Seed {seed}:", end=" ", flush=True)
+
+        # ── Per-seed resume: skip if checkpoint + metrics already exist ──
+        ckpt_path = os.path.join(args.output_dir, "checkpoints",
+                                 f"{model_class}_seed{seed}.pt")
+        seed_metric_path = os.path.join(args.output_dir, "run_configs",
+                                         f"{model_class}_seed{seed}_metrics.json")
+
+        if os.path.exists(ckpt_path) and os.path.exists(seed_metric_path):
+            print("[cached] loading checkpoint")
+            val_metrics = load_json(seed_metric_path)
+            seed_results.append({
+                "seed": seed,
+                "val_metrics": val_metrics,
+                "train_losses": [],
+                "val_losses": [],
+            })
+            continue
+
         set_seed(seed)
 
         train_cfg = {
@@ -411,12 +456,13 @@ def run_seed_robustness(model_class, best_config, feat_dim, d_traded, m_brownian
             )
 
             # Save checkpoint
-            ckpt_path = os.path.join(args.output_dir, "checkpoints",
-                                     f"{model_class}_seed{seed}.pt")
             state = {"nn1": nn1.state_dict()}
             if ctrl is not None:
                 state["controller"] = ctrl.state_dict()
             save_checkpoint(state, ckpt_path)
+
+            # Save per-seed metrics for resume
+            save_json(val_metrics, seed_metric_path)
 
             # Plots on validation data
             with torch.no_grad():
@@ -459,9 +505,10 @@ def run_seed_robustness(model_class, best_config, feat_dim, d_traded, m_brownian
                 args.cvar_q, device
             )
 
-            ckpt_path = os.path.join(args.output_dir, "checkpoints",
-                                     f"{model_class}_seed{seed}.pt")
             save_checkpoint(model.state_dict(), ckpt_path)
+
+            # Save per-seed metrics for resume
+            save_json(val_metrics, seed_metric_path)
 
             # Plots on validation data
             with torch.no_grad():
@@ -646,12 +693,24 @@ def run_pipeline(market_label, args, device, S_tilde, dW, time_grid, sigma,
 
     # ── Step 2: Build features ──────────────────
     print(f"\n=== [{market_label}] Step 2: Feature Construction ===")
-    features_train, features_val, features_test, feat_dim = build_features(
-        S_tilde, time_grid, args.T, train_idx, val_idx, test_idx,
-        latent_dim=args.latent_dim, sig_level=args.sig_level,
-        vae_epochs=50 if not args.quick else 10, device=device,
-        V_paths=V_paths,
-    )
+
+    data_dir = os.path.join(output_dir, "data")
+    feat_paths = [os.path.join(data_dir, f"features_{s}.pt")
+                  for s in ("train", "val", "test")]
+
+    if all(os.path.exists(p) for p in feat_paths):
+        print("  Loading cached features...")
+        features_train = torch.load(feat_paths[0], weights_only=True)
+        features_val = torch.load(feat_paths[1], weights_only=True)
+        features_test = torch.load(feat_paths[2], weights_only=True)
+        feat_dim = features_train.shape[2]
+    else:
+        features_train, features_val, features_test, feat_dim = build_features(
+            S_tilde, time_grid, args.T, train_idx, val_idx, test_idx,
+            latent_dim=args.latent_dim, sig_level=args.sig_level,
+            vae_epochs=50 if not args.quick else 10, device=device,
+            V_paths=V_paths,
+        )
     print(f"  Feature dim: {feat_dim}")
 
     # Split other data
@@ -724,11 +783,13 @@ def run_pipeline(market_label, args, device, S_tilde, dW, time_grid, sigma,
                 best, tlog = run_optuna_search(
                     model_class, feat_dim, args.d_traded, m_brownian, sigma,
                     hedger_train, hedger_val, args, device,
+                    output_dir=output_dir,
                 )
             else:
                 best, tlog = run_optuna_search(
                     model_class, feat_dim, args.d_traded, m_brownian, sigma,
                     bsde_train, bsde_val, args, device, time_grid=time_grid,
+                    output_dir=output_dir,
                 )
             best_configs[model_class] = best
             trial_logs[model_class] = tlog
@@ -975,6 +1036,9 @@ def main():
     gbm_comp = {}
     heston_agg = None
     heston_comp = {}
+    S_tilde = None
+    S_tilde_h = None
+    time_grid = None
 
     # ── GBM pipeline ──
     if args.market_model in ("gbm", "both"):
@@ -982,23 +1046,37 @@ def main():
         print("  MARKET MODEL: GBM (calibrated)")
         print("=" * 60)
         args.r = r_gbm
-        vols = gbm_params["vols"]
-        extra_vol = gbm_params.get("extra_vol", 0.06)
 
-        S_tilde, dW, time_grid, sigma = simulate_market(
-            args.paths, args.N, args.T, args.d_traded, args.m_brownian,
-            args.r, vols, extra_vol=extra_vol,
-            seed=args.seed_arch, device="cpu",
-        )
-        H_tilde = compute_european_put_payoff(S_tilde, K, args.r, args.T)
-        Z_intrinsic = compute_intrinsic_process(S_tilde, K, args.r, time_grid)
+        gbm_done_path = os.path.join(args.output_dir, "gbm", "metrics_summary.json")
+        gbm_complete = False
+        if os.path.exists(gbm_done_path):
+            gbm_saved = load_json(gbm_done_path)
+            saved_agg = gbm_saved.get("aggregated_val_metrics", {})
+            # Only skip if all 3 model classes have results
+            if all(mc in saved_agg for mc in ("FNN", "LSTM", "DBSDE")):
+                gbm_complete = True
 
-        print(f"  GBM: r={args.r}, vols={vols}, extra_vol={extra_vol}")
+        if gbm_complete:
+            print("  GBM pipeline already complete, loading results...")
+            gbm_agg = saved_agg
+        else:
+            vols = gbm_params["vols"]
+            extra_vol = gbm_params.get("extra_vol", 0.06)
 
-        gbm_agg, gbm_comp = run_pipeline(
-            "gbm", args, device, S_tilde, dW, time_grid, sigma,
-            H_tilde, Z_intrinsic, train_idx, val_idx, test_idx, split_hash,
-        )
+            S_tilde, dW, time_grid, sigma = simulate_market(
+                args.paths, args.N, args.T, args.d_traded, args.m_brownian,
+                args.r, vols, extra_vol=extra_vol,
+                seed=args.seed_arch, device="cpu",
+            )
+            H_tilde = compute_european_put_payoff(S_tilde, K, args.r, args.T)
+            Z_intrinsic = compute_intrinsic_process(S_tilde, K, args.r, time_grid)
+
+            print(f"  GBM: r={args.r}, vols={vols}, extra_vol={extra_vol}")
+
+            gbm_agg, gbm_comp = run_pipeline(
+                "gbm", args, device, S_tilde, dW, time_grid, sigma,
+                H_tilde, Z_intrinsic, train_idx, val_idx, test_idx, split_hash,
+            )
 
     # ── Heston pipeline ──
     if args.market_model in ("heston", "both"):
@@ -1006,31 +1084,44 @@ def main():
         print("  MARKET MODEL: Heston (calibrated)")
         print("=" * 60)
         args.r = r_heston
-        extra_vol_h = gbm_params.get("extra_vol", 0.06)
 
-        S_tilde_h, dW_h, time_grid_h, sigma_avg_h, V_paths_h = \
-            simulate_heston_market(
-                args.paths, args.N, args.T, args.d_traded, heston_params,
-                r=args.r, extra_vol=extra_vol_h,
-                seed=args.seed_arch, device="cpu",
+        heston_done_path = os.path.join(args.output_dir, "heston", "metrics_summary.json")
+        heston_complete = False
+        if os.path.exists(heston_done_path):
+            heston_saved = load_json(heston_done_path)
+            saved_agg = heston_saved.get("aggregated_val_metrics", {})
+            if all(mc in saved_agg for mc in ("FNN", "LSTM", "DBSDE")):
+                heston_complete = True
+
+        if heston_complete:
+            print("  Heston pipeline already complete, loading results...")
+            heston_agg = saved_agg
+        else:
+            extra_vol_h = gbm_params.get("extra_vol", 0.06)
+
+            S_tilde_h, dW_h, time_grid_h, sigma_avg_h, V_paths_h = \
+                simulate_heston_market(
+                    args.paths, args.N, args.T, args.d_traded, heston_params,
+                    r=args.r, extra_vol=extra_vol_h,
+                    seed=args.seed_arch, device="cpu",
+                )
+            H_tilde_h = compute_european_put_payoff(S_tilde_h, K, args.r, args.T)
+            Z_intrinsic_h = compute_intrinsic_process(S_tilde_h, K, args.r, time_grid_h)
+
+            m_brown_h = dW_h.shape[2]
+            # For Heston, sigma for the hedger is the sigma_avg (constant approx)
+            # and m_brownian is updated to match
+            args.m_brownian = m_brown_h
+
+            print(f"  Heston: r={args.r}, kappa={heston_params['kappa']}, "
+                  f"theta={heston_params['theta']}, xi={heston_params['xi']}, "
+                  f"rho={heston_params['rho']}")
+
+            heston_agg, heston_comp = run_pipeline(
+                "heston", args, device, S_tilde_h, dW_h, time_grid_h, sigma_avg_h,
+                H_tilde_h, Z_intrinsic_h, train_idx, val_idx, test_idx, split_hash,
+                V_paths=V_paths_h, heston_params=heston_params,
             )
-        H_tilde_h = compute_european_put_payoff(S_tilde_h, K, args.r, args.T)
-        Z_intrinsic_h = compute_intrinsic_process(S_tilde_h, K, args.r, time_grid_h)
-
-        m_brown_h = dW_h.shape[2]
-        # For Heston, sigma for the hedger is the sigma_avg (constant approx)
-        # and m_brownian is updated to match
-        args.m_brownian = m_brown_h
-
-        print(f"  Heston: r={args.r}, kappa={heston_params['kappa']}, "
-              f"theta={heston_params['theta']}, xi={heston_params['xi']}, "
-              f"rho={heston_params['rho']}")
-
-        heston_agg, heston_comp = run_pipeline(
-            "heston", args, device, S_tilde_h, dW_h, time_grid_h, sigma_avg_h,
-            H_tilde_h, Z_intrinsic_h, train_idx, val_idx, test_idx, split_hash,
-            V_paths=V_paths_h, heston_params=heston_params,
-        )
 
     # ── Step 8: Cross-model comparison ──
     if args.market_model == "both" and gbm_agg is not None and heston_agg is not None:
@@ -1039,53 +1130,63 @@ def main():
         print("=" * 60)
 
         comparison_dir = os.path.join(args.output_dir, "comparison")
-        ensure_dir(comparison_dir)
-        plot_model_comparison_gbm_vs_heston(gbm_agg, heston_agg, comparison_dir)
+        comparison_data_path = os.path.join(comparison_dir, "comparison_data.pt")
 
-        # Price path comparison (Heston vs GBM)
-        plot_price_vs_gbm(S_tilde_h, S_tilde, time_grid, comparison_dir)
+        # If both pipelines were loaded from cache, comparison plots already exist
+        if not gbm_comp and not heston_comp and os.path.exists(comparison_data_path):
+            print("  Both pipelines loaded from cache, comparison plots already exist.")
+            # Still save combined summary (cheap)
+            combined = {"gbm": gbm_agg, "heston": heston_agg}
+            save_json(combined, os.path.join(args.output_dir, "metrics_summary.json"))
+        else:
+            ensure_dir(comparison_dir)
+            plot_model_comparison_gbm_vs_heston(gbm_agg, heston_agg, comparison_dir)
 
-        # P&L comparison: GBM vs Heston per model
-        if gbm_comp and heston_comp:
-            plot_pnl_gbm_vs_heston(gbm_comp, heston_comp, comparison_dir)
-            plot_pnl_violin_gbm_vs_heston(gbm_comp, heston_comp, comparison_dir)
+            # Price path comparison (Heston vs GBM) — only if tensors available
+            if S_tilde_h is not None and S_tilde is not None:
+                plot_price_vs_gbm(S_tilde_h, S_tilde, time_grid, comparison_dir)
 
-            # Per-model individual figures (histogram + violin)
-            plot_pnl_per_model_hist(gbm_comp, heston_comp, comparison_dir)
-            plot_pnl_per_model_violin(gbm_comp, heston_comp, comparison_dir)
+            # P&L comparison: GBM vs Heston per model
+            if gbm_comp and heston_comp:
+                plot_pnl_gbm_vs_heston(gbm_comp, heston_comp, comparison_dir)
+                plot_pnl_violin_gbm_vs_heston(gbm_comp, heston_comp, comparison_dir)
 
-            # Cross-model same-regime figures (histogram + violin)
-            plot_pnl_all_models_by_regime_hist(gbm_comp, heston_comp, comparison_dir)
-            plot_pnl_all_models_by_regime_violin(gbm_comp, heston_comp, comparison_dir)
+                # Per-model individual figures (histogram + violin)
+                plot_pnl_per_model_hist(gbm_comp, heston_comp, comparison_dir)
+                plot_pnl_per_model_violin(gbm_comp, heston_comp, comparison_dir)
 
-        # Save comparison data for standalone replotting
-        comp_data = {}
-        if gbm_comp and heston_comp:
-            comp_data["gbm_comp"] = {
-                m: {k: v.cpu() if torch.is_tensor(v) else torch.tensor(v)
-                    for k, v in d.items()}
-                for m, d in gbm_comp.items()
-            }
-            comp_data["heston_comp"] = {
-                m: {k: v.cpu() if torch.is_tensor(v) else torch.tensor(v)
-                    for k, v in d.items()}
-                for m, d in heston_comp.items()
-            }
-        # Subsample price paths (only need ~50 for visual)
-        n_save = min(50, S_tilde.shape[0])
-        comp_data["S_tilde_gbm_sample"] = S_tilde[:n_save].cpu()
-        comp_data["S_tilde_heston_sample"] = S_tilde_h[:n_save].cpu()
-        comp_data["time_grid"] = time_grid.cpu()
-        torch.save(comp_data, os.path.join(comparison_dir, "comparison_data.pt"))
+                # Cross-model same-regime figures (histogram + violin)
+                plot_pnl_all_models_by_regime_hist(gbm_comp, heston_comp, comparison_dir)
+                plot_pnl_all_models_by_regime_violin(gbm_comp, heston_comp, comparison_dir)
 
-        # Save combined summary
-        combined = {
-            "gbm": gbm_agg,
-            "heston": heston_agg,
-        }
-        save_json(combined, os.path.join(args.output_dir, "metrics_summary.json"))
-        print(f"  Saved GBM vs Heston comparison to {comparison_dir}/")
-        print(f"  Saved replot data to {comparison_dir}/comparison_data.pt")
+            # Save comparison data for standalone replotting
+            comp_data = {}
+            if gbm_comp and heston_comp:
+                comp_data["gbm_comp"] = {
+                    m: {k: v.cpu() if torch.is_tensor(v) else torch.tensor(v)
+                        for k, v in d.items()}
+                    for m, d in gbm_comp.items()
+                }
+                comp_data["heston_comp"] = {
+                    m: {k: v.cpu() if torch.is_tensor(v) else torch.tensor(v)
+                        for k, v in d.items()}
+                    for m, d in heston_comp.items()
+                }
+            if S_tilde is not None and S_tilde_h is not None:
+                # Subsample price paths (only need ~50 for visual)
+                n_save = min(50, S_tilde.shape[0])
+                comp_data["S_tilde_gbm_sample"] = S_tilde[:n_save].cpu()
+                comp_data["S_tilde_heston_sample"] = S_tilde_h[:n_save].cpu()
+                comp_data["time_grid"] = time_grid.cpu()
+            if comp_data:
+                torch.save(comp_data, os.path.join(comparison_dir, "comparison_data.pt"))
+
+            # Save combined summary
+            combined = {"gbm": gbm_agg, "heston": heston_agg}
+            save_json(combined, os.path.join(args.output_dir, "metrics_summary.json"))
+            print(f"  Saved GBM vs Heston comparison to {comparison_dir}/")
+            if comp_data:
+                print(f"  Saved replot data to {comparison_dir}/comparison_data.pt")
 
     print("\n=== All Done ===")
     print(f"Results saved to {args.output_dir}/")
