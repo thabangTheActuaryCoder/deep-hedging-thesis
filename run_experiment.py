@@ -25,6 +25,8 @@ from src.sim.simulate_market import (
     simulate_market, compute_european_put_payoff,
     compute_intrinsic_process, split_data,
 )
+from src.sim.simulate_heston import simulate_heston_market
+from src.sim.calibration import load_market_params, load_heston_params
 from src.features.build_features import build_features
 from src.models.fnn import FNNHedger
 from src.models.lstm import LSTMHedger
@@ -43,6 +45,13 @@ from src.eval.plots import (
     plot_model_comparison_cvar, plot_validation_summary,
 )
 from src.eval.plots_3d import generate_3d_plots, generate_bsde_3d_plots
+from src.eval.plots_heston import (
+    plot_variance_paths, plot_implied_vol_surface,
+    plot_vol_distribution, plot_leverage_effect,
+    plot_vol_of_vol, plot_heston_summary,
+    plot_price_vs_gbm,
+    plot_model_comparison_gbm_vs_heston,
+)
 
 
 # ──────────────────────────────────────────────
@@ -53,13 +62,18 @@ def parse_args():
     p = argparse.ArgumentParser(description="Deep Hedging Experiment")
 
     # Market
-    p.add_argument("--paths", type=int, default=50000)
+    p.add_argument("--paths", type=int, default=100000)
     p.add_argument("--N", type=int, default=200)
     p.add_argument("--T", type=float, default=1.0)
     p.add_argument("--d_traded", type=int, default=2)
     p.add_argument("--m_brownian", type=int, default=3)
     p.add_argument("--K", type=float, default=1.0)
     p.add_argument("--r", type=float, default=0.0)
+    p.add_argument("--market_model", type=str, default="both",
+                   choices=["gbm", "heston", "both"],
+                   help="Market model to use: gbm, heston, or both")
+    p.add_argument("--market_config", type=str, default="",
+                   help="Path to market params JSON (default: data/market_params_sp500.json)")
 
     # Features
     p.add_argument("--latent_dim", type=int, default=16)
@@ -147,10 +161,10 @@ def make_controller(feat_dim, d_traded, depth, width, act_schedule,
 
 
 def make_bsde(feat_dim, d_traded, m_brownian, sigma, depth, width,
-              act_schedule, dropout, device):
+              act_schedule, dropout, device, sigma_avg=None):
     return DeepBSDE(feat_dim, d_traded, m_brownian, sigma,
                     depth=depth, width=width, act_schedule=act_schedule,
-                    dropout=dropout).to(device)
+                    dropout=dropout, sigma_avg=sigma_avg).to(device)
 
 
 # ──────────────────────────────────────────────
@@ -584,31 +598,39 @@ def run_substeps_study(best_bsde_config, feat_dim, d_traded, m_brownian, sigma,
 # Main
 # ──────────────────────────────────────────────
 
-def main():
-    args = parse_args()
-    device = get_device()
-    print(f"Device: {device}")
-    print(f"Quick mode: {args.quick}")
+def run_pipeline(market_label, args, device, S_tilde, dW, time_grid, sigma,
+                 H_tilde, Z_intrinsic, train_idx, val_idx, test_idx,
+                 split_hash, V_paths=None, heston_params=None):
+    """Run the full training pipeline (Steps 2-7) for one market model.
 
-    output_dir = "outputs"
-    args.output_dir = output_dir
-    for sub in ["plots", "plots_val", "plots_3d", "checkpoints", "run_configs"]:
+    Args:
+        market_label: "gbm" or "heston"
+        args: parsed CLI args
+        device: torch device
+        S_tilde, dW, time_grid, sigma: simulated market data
+            For Heston, sigma should be the effective sigma_avg matrix.
+        H_tilde: discounted payoffs
+        Z_intrinsic: intrinsic value process
+        train_idx, val_idx, test_idx: split indices
+        split_hash: reproducibility hash
+        V_paths: [n_paths, N+1, d_traded] variance paths (Heston only)
+        heston_params: dict with kappa, theta, xi, rho, v0 (Heston only)
+
+    Returns:
+        all_agg: {model_name: aggregated val metrics}
+    """
+    output_dir = os.path.join(args.output_dir, market_label)
+    for sub in ["plots", "plots_val", "plots_3d", "checkpoints", "run_configs",
+                "data"]:
         ensure_dir(os.path.join(output_dir, sub))
+    if market_label == "heston":
+        ensure_dir(os.path.join(output_dir, "plots_heston"))
 
-    # ── Step 1: Simulate market ─────────────────
-    print("\n=== Step 1: Market Simulation ===")
-    set_seed(args.seed_arch)
-    S_tilde, dW, time_grid, sigma = simulate_market(
-        args.paths, args.N, args.T, args.d_traded, args.m_brownian,
-        args.r, [0.2] * args.d_traded, seed=args.seed_arch, device="cpu",
-    )
-    H_tilde = compute_european_put_payoff(S_tilde, args.K, args.r, args.T)
-    Z_intrinsic = compute_intrinsic_process(S_tilde, args.K, args.r, time_grid)
-    train_idx, val_idx, test_idx = split_data(args.paths, seed=args.seed_arch)
+    m_brownian = dW.shape[2]
 
-    split_hash = compute_split_hash(train_idx, val_idx, test_idx)
-    print(f"  Paths={args.paths}  N={args.N}  Split hash={split_hash}")
-    print(f"  Train={len(train_idx)}  Val={len(val_idx)}  Test={len(test_idx)}")
+    print(f"\n{'='*60}")
+    print(f"  Pipeline: {market_label.upper()} market  (m_brownian={m_brownian})")
+    print(f"{'='*60}")
 
     # Save split indices
     save_json({"train": train_idx.tolist(), "val": val_idx.tolist(),
@@ -616,11 +638,12 @@ def main():
               os.path.join(output_dir, "run_configs", "split_indices.json"))
 
     # ── Step 2: Build features ──────────────────
-    print("\n=== Step 2: Feature Construction ===")
+    print(f"\n=== [{market_label}] Step 2: Feature Construction ===")
     features_train, features_val, features_test, feat_dim = build_features(
         S_tilde, time_grid, args.T, train_idx, val_idx, test_idx,
         latent_dim=args.latent_dim, sig_level=args.sig_level,
         vae_epochs=50 if not args.quick else 10, device=device,
+        V_paths=V_paths,
     )
     print(f"  Feature dim: {feat_dim}")
 
@@ -638,7 +661,7 @@ def main():
     dW_val = dW[val_idx]
     dW_test = dW[test_idx]
 
-    # Prepare data dicts (train + val only; test deferred)
+    # Prepare data dicts
     hedger_train = prepare_hedger_data(features_train, S_tilde_train, Z_train, H_train, device)
     hedger_val = prepare_hedger_data(features_val, S_tilde_val, Z_val, H_val, device)
 
@@ -647,7 +670,6 @@ def main():
 
     # Save feature tensors
     data_dir = os.path.join(output_dir, "data")
-    ensure_dir(data_dir)
     for name, tensor in [("features_train", features_train),
                          ("features_val", features_val),
                          ("features_test", features_test),
@@ -660,12 +682,11 @@ def main():
         torch.save(tensor, os.path.join(data_dir, f"{name}.pt"))
 
     # ── Step 3: Stage 1 – Optuna HP search ─────
-    print("\n=== Step 3: Stage 1 – Optuna HP Search (TPE) ===")
+    print(f"\n=== [{market_label}] Step 3: Stage 1 – Optuna HP Search (TPE) ===")
 
     all_models = ["FNN", "LSTM", "DBSDE"]
     stage1_path = os.path.join(output_dir, "run_configs", "stage1_optuna.json")
 
-    # Try to load existing Stage 1 results
     best_configs = {}
     trial_logs = {}
     if os.path.exists(stage1_path):
@@ -694,29 +715,31 @@ def main():
             print(f"\n--- {model_class} ---")
             if model_class in ("FNN", "LSTM"):
                 best, tlog = run_optuna_search(
-                    model_class, feat_dim, args.d_traded, args.m_brownian, sigma,
+                    model_class, feat_dim, args.d_traded, m_brownian, sigma,
                     hedger_train, hedger_val, args, device,
                 )
             else:
                 best, tlog = run_optuna_search(
-                    model_class, feat_dim, args.d_traded, args.m_brownian, sigma,
+                    model_class, feat_dim, args.d_traded, m_brownian, sigma,
                     bsde_train, bsde_val, args, device, time_grid=time_grid,
                 )
             best_configs[model_class] = best
             trial_logs[model_class] = tlog
 
-            # Incremental save after each model's search
             save_json({"best_configs": best_configs, "trial_logs": trial_logs},
                       stage1_path)
             print(f"  [saved Stage 1 progress: {list(best_configs.keys())}]")
 
     # ── Step 4: Stage 2 – Seed robustness (val only) ──
-    print("\n=== Step 4: Stage 2 – Seed Robustness (Validation) ===")
+    print(f"\n=== [{market_label}] Step 4: Stage 2 – Seed Robustness (Validation) ===")
 
     summary_path = os.path.join(output_dir, "metrics_summary.json")
     val_metrics_path = os.path.join(output_dir, "val_metrics.json")
 
-    # Try to load existing Stage 2 results
+    # Temporarily override output_dir in args for seed robustness
+    orig_output_dir = args.output_dir
+    args.output_dir = output_dir
+
     all_results = {}
     all_agg = {}
     all_comparison = {}
@@ -747,7 +770,7 @@ def main():
             if model_class in ("FNN", "LSTM"):
                 seed_res, agg, comp_data = run_seed_robustness(
                     model_class, best_configs[model_class],
-                    feat_dim, args.d_traded, args.m_brownian, sigma,
+                    feat_dim, args.d_traded, m_brownian, sigma,
                     hedger_train, hedger_val,
                     args, device,
                     S_tilde_val=S_tilde_val.to(device),
@@ -756,7 +779,7 @@ def main():
             else:
                 seed_res, agg, comp_data = run_seed_robustness(
                     model_class, best_configs[model_class],
-                    feat_dim, args.d_traded, args.m_brownian, sigma,
+                    feat_dim, args.d_traded, m_brownian, sigma,
                     bsde_train, bsde_val,
                     args, device,
                     S_tilde_val=S_tilde_val.to(device),
@@ -768,27 +791,29 @@ def main():
             all_agg[model_class] = agg
             all_comparison[model_class] = comp_data
 
-            # Incremental save after each model's seed robustness
             save_json(
                 {"best_configs": best_configs,
                  "aggregated_val_metrics": {m: all_agg[m] for m in all_agg},
                  "config": {
                      "paths": args.paths, "N": args.N, "T": args.T,
-                     "d_traded": args.d_traded, "m_brownian": args.m_brownian,
+                     "d_traded": args.d_traded, "m_brownian": m_brownian,
                      "K": args.K, "r": args.r, "seed_arch": args.seed_arch,
                      "seeds": args.seeds, "split_hash": split_hash,
+                     "market_model": market_label,
                  }},
                 summary_path,
             )
             _write_csv_summary(all_agg, os.path.join(output_dir, "val_metrics_summary.csv"))
             print(f"  [saved Stage 2 progress: {list(all_agg.keys())}]")
 
+    # Restore original output_dir
+    args.output_dir = orig_output_dir
+
     # ── Step 5: Validation Analysis ────────────
-    print("\n=== Step 5: Validation Analysis ===")
+    print(f"\n=== [{market_label}] Step 5: Validation Analysis ===")
 
     plots_val_dir = os.path.join(output_dir, "plots_val")
 
-    # Determine best model (lowest mean CVaR95_shortfall)
     best_model = min(
         all_agg.keys(),
         key=lambda m: (all_agg[m]["CVaR95_shortfall"]["mean"]
@@ -797,19 +822,12 @@ def main():
     )
     print(f"  Best model: {best_model}")
 
-    # Summary table (parameterized title)
     plot_summary_table(all_agg, output_dir=plots_val_dir,
-                       title="Model Comparison (Validation Set)")
-
-    # Highlighted validation summary
+                       title=f"Model Comparison – {market_label.upper()} (Validation Set)")
     plot_validation_summary(all_agg, best_model, output_dir=plots_val_dir)
-
-    # Grouped bar chart
     plot_model_comparison_bars(all_agg, output_dir=plots_val_dir)
 
-    # Comparison plots require comparison_data (only available if Stage 2 ran fresh)
     if all_comparison:
-        # Overlay error histograms
         model_errors_dict = {}
         model_VT_dict = {}
         model_H_dict = {}
@@ -828,7 +846,22 @@ def main():
     else:
         print("  Comparison plots skipped (loaded from cache, no tensor data)")
 
-    # Save val_metrics.json
+    # Heston-specific stochastic volatility plots
+    if market_label == "heston" and V_paths is not None:
+        heston_plot_dir = os.path.join(output_dir, "plots_heston")
+        plot_variance_paths(V_paths, time_grid, heston_plot_dir)
+        plot_implied_vol_surface(S_tilde, V_paths, args.K, args.T,
+                                 time_grid, heston_plot_dir)
+        plot_vol_of_vol(V_paths, time_grid, heston_plot_dir)
+        plot_leverage_effect(S_tilde, V_paths, time_grid, heston_plot_dir)
+        if heston_params is not None:
+            plot_vol_distribution(V_paths, time_grid, heston_params, heston_plot_dir)
+            plot_heston_summary(V_paths, S_tilde, time_grid, heston_params,
+                                heston_plot_dir)
+        print("  Generated Heston stochastic volatility plots:"
+              " variance paths, vol smile, vol distribution,"
+              " leverage effect, vol-of-vol, summary")
+
     save_json(
         {"aggregated_val_metrics": all_agg, "best_model": best_model},
         val_metrics_path,
@@ -837,13 +870,15 @@ def main():
     print(f"  Saved val_metrics.json and val_metrics_summary.csv")
 
     # ── Step 6: DBSDE substeps study ────────────
-    print("\n=== Step 6: DBSDE Substeps Study ===")
+    print(f"\n=== [{market_label}] Step 6: DBSDE Substeps Study ===")
 
-    # Check if substeps results already exist in saved summary
     sub_results = []
     if os.path.exists(summary_path):
         summary_saved = load_json(summary_path)
         sub_results = summary_saved.get("substeps_study", [])
+
+    # Temporarily set output_dir for substeps
+    args.output_dir = output_dir
 
     if sub_results:
         print("  Found completed substeps results, skipping.")
@@ -852,7 +887,7 @@ def main():
                   f"MSE={sr['val_MSE']:.6f}  CVaR95={sr['val_CVaR95']:.6f}")
     elif len(args.substeps) > 1:
         sub_results = run_substeps_study(
-            best_configs["DBSDE"], feat_dim, args.d_traded, args.m_brownian,
+            best_configs["DBSDE"], feat_dim, args.d_traded, m_brownian,
             sigma, bsde_train, bsde_val, args.substeps, args, device, time_grid,
         )
         plot_substeps_convergence(
@@ -862,18 +897,20 @@ def main():
         sub_results = []
         print("  Skipped (only 1 substep value).")
 
-    # ── Step 7: Save final results (val metrics only) ──
-    print("\n=== Step 7: Saving Final Results ===")
+    args.output_dir = orig_output_dir
 
-    # Final JSON summary (overwrites incremental with substeps added)
+    # ── Step 7: Save final results ──
+    print(f"\n=== [{market_label}] Step 7: Saving Final Results ===")
+
     summary = {
         "best_configs": best_configs,
         "aggregated_val_metrics": {},
         "best_model": best_model,
         "substeps_study": sub_results,
+        "market_model": market_label,
         "config": {
             "paths": args.paths, "N": args.N, "T": args.T,
-            "d_traded": args.d_traded, "m_brownian": args.m_brownian,
+            "d_traded": args.d_traded, "m_brownian": m_brownian,
             "K": args.K, "r": args.r, "seed_arch": args.seed_arch,
             "seeds": args.seeds, "split_hash": split_hash,
         },
@@ -882,12 +919,125 @@ def main():
         summary["aggregated_val_metrics"][mc] = all_agg[mc]
 
     save_json(summary, summary_path)
-
-    # Final CSV
     _write_csv_summary(all_agg, os.path.join(output_dir, "val_metrics_summary.csv"))
 
-    print("\n=== Done ===")
-    print(f"Results saved to {output_dir}/")
+    print(f"\n  [{market_label}] Done. Results saved to {output_dir}/")
+    return all_agg
+
+
+def main():
+    args = parse_args()
+    device = get_device()
+    print(f"Device: {device}")
+    print(f"Quick mode: {args.quick}")
+    print(f"Market model: {args.market_model}")
+
+    args.output_dir = "outputs"
+    ensure_dir(args.output_dir)
+
+    # Load calibrated parameters
+    config_path = args.market_config or None
+    gbm_params = load_market_params(config_path)
+    heston_params = load_heston_params(config_path)
+
+    # Override r/K/T from calibrated params (CLI defaults may differ)
+    r_gbm = gbm_params.get("r", args.r)
+    r_heston = heston_params.get("r", args.r)
+    K = gbm_params.get("K", args.K)
+    T = gbm_params.get("T", args.T)
+    args.K = K
+    args.T = T
+
+    # Common data split (same for both market models — 100k paths)
+    set_seed(args.seed_arch)
+    train_idx, val_idx, test_idx = split_data(args.paths, seed=args.seed_arch)
+    split_hash = compute_split_hash(train_idx, val_idx, test_idx)
+    print(f"Paths={args.paths}  Split hash={split_hash}")
+    print(f"Train={len(train_idx)}  Val={len(val_idx)}  Test={len(test_idx)}")
+
+    gbm_agg = None
+    heston_agg = None
+
+    # ── GBM pipeline ──
+    if args.market_model in ("gbm", "both"):
+        print("\n" + "=" * 60)
+        print("  MARKET MODEL: GBM (calibrated)")
+        print("=" * 60)
+        args.r = r_gbm
+        vols = gbm_params["vols"]
+        extra_vol = gbm_params.get("extra_vol", 0.06)
+
+        S_tilde, dW, time_grid, sigma = simulate_market(
+            args.paths, args.N, args.T, args.d_traded, args.m_brownian,
+            args.r, vols, extra_vol=extra_vol,
+            seed=args.seed_arch, device="cpu",
+        )
+        H_tilde = compute_european_put_payoff(S_tilde, K, args.r, args.T)
+        Z_intrinsic = compute_intrinsic_process(S_tilde, K, args.r, time_grid)
+
+        print(f"  GBM: r={args.r}, vols={vols}, extra_vol={extra_vol}")
+
+        gbm_agg = run_pipeline(
+            "gbm", args, device, S_tilde, dW, time_grid, sigma,
+            H_tilde, Z_intrinsic, train_idx, val_idx, test_idx, split_hash,
+        )
+
+    # ── Heston pipeline ──
+    if args.market_model in ("heston", "both"):
+        print("\n" + "=" * 60)
+        print("  MARKET MODEL: Heston (calibrated)")
+        print("=" * 60)
+        args.r = r_heston
+        extra_vol_h = gbm_params.get("extra_vol", 0.06)
+
+        S_tilde_h, dW_h, time_grid_h, sigma_avg_h, V_paths_h = \
+            simulate_heston_market(
+                args.paths, args.N, args.T, args.d_traded, heston_params,
+                r=args.r, extra_vol=extra_vol_h,
+                seed=args.seed_arch, device="cpu",
+            )
+        H_tilde_h = compute_european_put_payoff(S_tilde_h, K, args.r, args.T)
+        Z_intrinsic_h = compute_intrinsic_process(S_tilde_h, K, args.r, time_grid_h)
+
+        m_brown_h = dW_h.shape[2]
+        # For Heston, sigma for the hedger is the sigma_avg (constant approx)
+        # and m_brownian is updated to match
+        args.m_brownian = m_brown_h
+
+        print(f"  Heston: r={args.r}, kappa={heston_params['kappa']}, "
+              f"theta={heston_params['theta']}, xi={heston_params['xi']}, "
+              f"rho={heston_params['rho']}")
+
+        heston_agg = run_pipeline(
+            "heston", args, device, S_tilde_h, dW_h, time_grid_h, sigma_avg_h,
+            H_tilde_h, Z_intrinsic_h, train_idx, val_idx, test_idx, split_hash,
+            V_paths=V_paths_h, heston_params=heston_params,
+        )
+
+    # ── Step 8: Cross-model comparison ──
+    if args.market_model == "both" and gbm_agg is not None and heston_agg is not None:
+        print("\n" + "=" * 60)
+        print("  Step 8: GBM vs Heston Comparison")
+        print("=" * 60)
+
+        comparison_dir = os.path.join(args.output_dir, "comparison")
+        ensure_dir(comparison_dir)
+        plot_model_comparison_gbm_vs_heston(gbm_agg, heston_agg, comparison_dir)
+
+        # Price path comparison (Heston vs GBM)
+        # S_tilde (GBM) and S_tilde_h (Heston) are still in scope from above
+        plot_price_vs_gbm(S_tilde_h, S_tilde, time_grid, comparison_dir)
+
+        # Save combined summary
+        combined = {
+            "gbm": gbm_agg,
+            "heston": heston_agg,
+        }
+        save_json(combined, os.path.join(args.output_dir, "metrics_summary.json"))
+        print(f"  Saved GBM vs Heston comparison to {comparison_dir}/")
+
+    print("\n=== All Done ===")
+    print(f"Results saved to {args.output_dir}/")
 
 
 def _write_csv_summary(all_agg, path):

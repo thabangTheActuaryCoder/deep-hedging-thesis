@@ -61,6 +61,10 @@ class ExperimentConfig:
     # DBSDE
     substeps: List[int] = field(default_factory=lambda: [0, 5, 10])
 
+    # Market model
+    market_model: str = "both"  # "gbm", "heston", or "both"
+    market_config: str = ""  # path to market_params JSON (empty = use defaults)
+
     # Paths
     output_dir: str = "outputs"
     data_dir: str = "data"

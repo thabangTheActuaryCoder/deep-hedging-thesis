@@ -1,0 +1,22 @@
+{
+  "source": "S&P 500 / CBOE VIX, Jan 2026",
+  "note": "Calibrated parameters for deep hedging experiments",
+  "paths": 100000,
+  "gbm": {
+    "r": 0.043,
+    "vols": [0.18, 0.22],
+    "extra_vol": 0.06,
+    "K": 1.0,
+    "T": 1.0
+  },
+  "heston": {
+    "r": 0.043,
+    "K": 1.0,
+    "T": 1.0,
+    "kappa": [2.0, 2.0],
+    "theta": [0.04, 0.05],
+    "xi": [0.3, 0.35],
+    "rho": [-0.7, -0.65],
+    "v0": [0.04, 0.05]
+  }
+}

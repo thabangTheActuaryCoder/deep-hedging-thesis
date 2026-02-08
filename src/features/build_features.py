@@ -2,26 +2,43 @@
 
 All features are strictly causal (X_k depends only on data up to time k).
 Standardization is computed on the training set only.
+Supports optional variance paths (Heston model) as additional base features.
 """
 import torch
 from src.features.vae import train_vae, encode_paths
 from src.features.signatures import compute_signature_features
 
 
-def build_base_features(S_tilde, time_grid, T):
-    """Base features: log(S_tilde^1), log(S_tilde^2), tau_k = T - t_k.
+def build_base_features(S_tilde, time_grid, T, V_paths=None):
+    """Base features: log(S_tilde^i), tau_k, and optionally log(v_i).
+
+    For GBM: [log(S1), log(S2), tau]  (d_traded + 1 dims)
+    For Heston: [log(S1), log(S2), tau, log(v1), log(v2)]  (2*d_traded + 1 dims)
+
+    Args:
+        S_tilde: [n_paths, N+1, d_traded]
+        time_grid: [N+1]
+        T: terminal time
+        V_paths: [n_paths, N+1, d_traded] variance paths (Heston) or None (GBM)
 
     Returns:
-        base: [n_paths, N+1, d_traded + 1]
+        base: [n_paths, N+1, base_dim]
     """
     n_paths, N_plus_1, d = S_tilde.shape
     log_S = torch.log(S_tilde.clamp(min=1e-8))
     tau = (T - time_grid).unsqueeze(0).unsqueeze(2).expand(n_paths, N_plus_1, 1)
-    return torch.cat([log_S, tau], dim=2)
+    parts = [log_S, tau]
+
+    if V_paths is not None:
+        log_V = torch.log(V_paths.clamp(min=1e-8))
+        parts.append(log_V)
+
+    return torch.cat(parts, dim=2)
 
 
 def build_features(S_tilde, time_grid, T, train_idx, val_idx, test_idx,
-                   latent_dim=16, sig_level=2, vae_epochs=50, device="cpu"):
+                   latent_dim=16, sig_level=2, vae_epochs=50, device="cpu",
+                   V_paths=None):
     """Build full feature tensor: base + VAE latent + signatures.
 
     VAE is trained only on training paths to prevent information leakage.
@@ -36,6 +53,7 @@ def build_features(S_tilde, time_grid, T, train_idx, val_idx, test_idx,
         sig_level: signature truncation level
         vae_epochs: VAE training epochs
         device: torch device
+        V_paths: [n_paths, N+1, d_traded] variance paths (Heston) or None (GBM)
 
     Returns:
         features_train: [n_train, N+1, feat_dim]
@@ -43,8 +61,8 @@ def build_features(S_tilde, time_grid, T, train_idx, val_idx, test_idx,
         features_test: [n_test, N+1, feat_dim]
         feat_dim: int
     """
-    # Base features
-    base = build_base_features(S_tilde, time_grid, T)
+    # Base features (includes log-variance if V_paths provided)
+    base = build_base_features(S_tilde, time_grid, T, V_paths=V_paths)
 
     # Signature features
     log_prices = torch.log(S_tilde.clamp(min=1e-8))

@@ -22,7 +22,19 @@ class DeepBSDE(nn.Module):
     """
 
     def __init__(self, input_dim, d_traded, m_brownian, sigma_matrix,
-                 depth=5, width=128, act_schedule="relu_all", dropout=0.1):
+                 depth=5, width=128, act_schedule="relu_all", dropout=0.1,
+                 sigma_avg=None):
+        """
+        Args:
+            input_dim: feature dimension
+            d_traded: number of traded assets
+            m_brownian: number of Brownian drivers
+            sigma_matrix: [d_traded, m_brownian] diffusion matrix
+            depth, width, act_schedule, dropout: architecture params
+            sigma_avg: optional [d_traded, m_brownian] effective sigma for
+                       Z-to-Delta projection (e.g. sqrt(theta) for Heston).
+                       If None, uses sigma_matrix for projection.
+        """
         super().__init__()
         self.d_traded = d_traded
         self.m_brownian = m_brownian
@@ -47,9 +59,11 @@ class DeepBSDE(nn.Module):
         self.z_head = nn.Linear(width, m_brownian)
 
         # Store sigma for Z-to-Delta projection
+        # Use sigma_avg if provided (e.g. Heston effective sigma), else sigma_matrix
+        proj_sigma = sigma_avg if sigma_avg is not None else sigma_matrix
         self.register_buffer("sigma", sigma_matrix.clone())
         # Pre-compute pseudo-inverse of sigma^T
-        sigma_T_pinv = torch.linalg.pinv(sigma_matrix.T)  # [d_traded, m_brownian]
+        sigma_T_pinv = torch.linalg.pinv(proj_sigma.T)  # [d_traded, m_brownian]
         self.register_buffer("sigma_T_pinv", sigma_T_pinv)
 
     def time_embedding(self, t):
