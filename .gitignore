@@ -17,6 +17,7 @@
 # Keep documentation
 !README.md
 !README.txt
+!algorithms.md
 
 # Deep hedging codebase
 !src/
