@@ -1,97 +1,113 @@
+"""Evaluation metrics for hedging performance.
+
+Reports both terminal-value metrics and dynamic hedging diagnostics.
 """
-Evaluation metrics for hedging performance.
-
-Metrics computed on (V_T, H) pairs:
-- MAE: Mean Absolute Error
-- MSE: Mean Squared Error
-- R2: Coefficient of determination
-
-Additional statistics:
-- mean/std of total hedging error
-- mean/std of worst hedging error
-- shortfall rate: P(worst_error < 0)
-"""
-
-import torch
 import numpy as np
-from typing import Dict
+import torch
+from src.training.losses import terminal_error, shortfall, cvar
 
 
-def compute_metrics(
-    V_T: torch.Tensor,
-    H: torch.Tensor,
-    total_error: torch.Tensor,
-    worst_error: torch.Tensor = None,
-) -> Dict[str, float]:
-    """Compute all hedging performance metrics.
+def compute_metrics(V_T, H_tilde, V_path=None, Z_intrinsic=None, cvar_q=0.95):
+    """Compute full suite of hedging metrics.
 
     Args:
-        V_T: Terminal portfolio value [paths]
-        H: Terminal payoff [paths]
-        total_error: V_T - H [paths]
-        worst_error: min_k(V_k - Z_k) [paths], optional
+        V_T: [n] terminal portfolio value
+        H_tilde: [n] discounted payoff
+        V_path: [n, N+1] optional portfolio path (for daily P/L metrics)
+        Z_intrinsic: [n, N+1] optional intrinsic process
 
     Returns:
-        dict of metric name -> value
+        metrics: dict of metric name -> value
     """
-    V_T = V_T.detach().cpu()
-    H = H.detach().cpu()
-    total_error = total_error.detach().cpu()
+    e = terminal_error(V_T, H_tilde)
+    s = shortfall(V_T, H_tilde)
 
-    mae = torch.mean(torch.abs(V_T - H)).item()
-    mse = torch.mean((V_T - H) ** 2).item()
-
-    # R2
-    ss_res = torch.sum((H - V_T) ** 2).item()
-    ss_tot = torch.sum((H - torch.mean(H)) ** 2).item()
-    r2 = 1.0 - ss_res / max(ss_tot, 1e-10)
-
+    # Terminal metrics
     metrics = {
-        'MAE': mae,
-        'MSE': mse,
-        'R2': r2,
-        'total_error_mean': total_error.mean().item(),
-        'total_error_std': total_error.std().item(),
+        "MAE": e.abs().mean().item(),
+        "MSE": (e ** 2).mean().item(),
+        "R2": _r2(V_T, H_tilde),
+        "mean_error": e.mean().item(),
+        "std_error": e.std().item(),
+        "P_negative_error": (e < 0).float().mean().item(),
+        "mean_shortfall": s.mean().item(),
+        "CVaR90_shortfall": cvar(s, q=0.90).item(),
+        "CVaR95_shortfall": cvar(s, q=0.95).item(),
+        "CVaR99_shortfall": cvar(s, q=0.99).item(),
     }
 
-    if worst_error is not None:
-        worst_error = worst_error.detach().cpu()
-        metrics['worst_error_mean'] = worst_error.mean().item()
-        metrics['worst_error_std'] = worst_error.std().item()
-        metrics['shortfall_rate'] = (worst_error < 0).float().mean().item()
+    # Intrinsic gap metrics
+    if V_path is not None and Z_intrinsic is not None:
+        gap = V_path - Z_intrinsic  # [n, N+1]
+        metrics["mean_intrinsic_gap"] = gap.mean().item()
+        metrics["P_negative_intrinsic_gap"] = (gap < 0).float().mean().item()
+
+    # Daily P/L metrics
+    if V_path is not None:
+        dPL = V_path[:, 1:] - V_path[:, :-1]  # [n, N]
+        metrics["mean_dPL"] = dPL.mean().item()
+        metrics["std_dPL"] = dPL.std().item()
+        # Worst daily loss per path
+        worst_daily = dPL.min(dim=1)[0]  # [n]
+        metrics["mean_worst_daily_loss"] = worst_daily.mean().item()
+        metrics["std_worst_daily_loss"] = worst_daily.std().item()
+        # Max drawdown
+        running_max = torch.cummax(V_path, dim=1)[0]
+        drawdown = (running_max - V_path).max(dim=1)[0]
+        metrics["mean_max_drawdown"] = drawdown.mean().item()
+        metrics["std_max_drawdown"] = drawdown.std().item()
 
     return metrics
 
 
-def format_metrics(metrics: Dict[str, float], model_name: str = "") -> str:
-    """Format metrics dict as a readable string."""
-    lines = []
-    if model_name:
-        lines.append(f"--- {model_name} ---")
-    for k, v in metrics.items():
-        lines.append(f"  {k:25s}: {v:.6f}")
-    return "\n".join(lines)
+def _r2(predictions, targets):
+    """R-squared: 1 - SS_res/SS_tot."""
+    ss_res = ((predictions - targets) ** 2).sum().item()
+    ss_tot = ((targets - targets.mean()) ** 2).sum().item()
+    if ss_tot < 1e-12:
+        return 0.0
+    return 1.0 - ss_res / ss_tot
 
 
-def aggregate_seed_metrics(seed_metrics: list) -> Dict[str, str]:
-    """Aggregate metrics across seeds (mean +/- std).
+def aggregate_seed_metrics(seed_metrics_list):
+    """Aggregate metrics across seeds: mean +/- std + 95% CI.
 
     Args:
-        seed_metrics: List of metric dicts from different seeds
+        seed_metrics_list: list of dicts (one per seed)
 
     Returns:
-        dict of metric name -> "mean +/- std" string
+        agg: dict with mean, std, ci_lo, ci_hi for each metric
     """
-    keys = seed_metrics[0].keys()
-    result = {}
-    result_raw = {}
+    keys = seed_metrics_list[0].keys()
+    agg = {}
+    n = len(seed_metrics_list)
 
-    for k in keys:
-        vals = [m[k] for m in seed_metrics]
-        mean = np.mean(vals)
-        std = np.std(vals)
-        result[k] = f"{mean:.6f} +/- {std:.6f}"
-        result_raw[k + '_mean'] = mean
-        result_raw[k + '_std'] = std
+    for key in keys:
+        vals = [m[key] for m in seed_metrics_list]
+        arr = np.array(vals)
+        mean = arr.mean()
+        std = arr.std(ddof=1) if n > 1 else 0.0
+        se = std / np.sqrt(n) if n > 1 else 0.0
+        t_val = 2.776 if n == 5 else 2.0  # approx t-crit for 95% CI
+        agg[key] = {
+            "mean": float(mean),
+            "std": float(std),
+            "ci_lo": float(mean - t_val * se),
+            "ci_hi": float(mean + t_val * se),
+            "values": vals,
+        }
 
-    return result, result_raw
+    return agg
+
+
+def select_representative_seed(seed_results):
+    """Pick representative seed = argmin validation CVaR95(shortfall).
+
+    Args:
+        seed_results: list of dicts with "seed" and "val_metrics" keys
+
+    Returns:
+        best_seed: int
+    """
+    best = min(seed_results, key=lambda r: r["val_metrics"]["CVaR95_shortfall"])
+    return best["seed"]

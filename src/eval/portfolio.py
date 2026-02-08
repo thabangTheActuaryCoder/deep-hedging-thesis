@@ -1,111 +1,87 @@
+"""Portfolio simulation and hedging error computation.
+
+Uses discounted self-financing: V_{k+1} = V_k + Delta_k^T * (S_tilde_{k+1} - S_tilde_k).
 """
-Self-financing portfolio simulation and hedging error computation.
-
-Portfolio dynamics:
-    V_{k+1} = V_k + sum_j Delta_k^j * (S_{k+1}^j - S_k^j)
-
-Errors:
-    total_error = V_T - H  (terminal hedging error)
-    worst_error = min_k (V_k - Z_k)  (worst hedging error across exercise times)
-"""
-
 import torch
-from typing import Tuple, Optional
+from src.training.train import forward_portfolio
 
 
-def simulate_portfolio(
-    deltas: torch.Tensor,
-    S: torch.Tensor,
-    V0: float = 0.0,
-) -> torch.Tensor:
-    """Simulate self-financing portfolio terminal value.
+def simulate_portfolio_path(nn1, controller, features, Z_intrinsic, dS,
+                            use_controller=True):
+    """Full portfolio simulation returning path-level diagnostics.
 
     Args:
-        deltas: Hedge ratios [paths, N, d_traded]
-        S: Stock prices [paths, N+1, d_traded]
-        V0: Initial portfolio value
+        nn1, controller: models (eval mode)
+        features: [batch, N, feat_dim]
+        Z_intrinsic: [batch, N]
+        dS: [batch, N, d_traded]
 
     Returns:
-        V_T: Terminal portfolio value [paths]
+        V_path: [batch, N+1] portfolio value path
+        Delta: [batch, N, d_traded] hedge ratios
+        info: dict with gate, Delta0, etc.
     """
-    # Price increments: dS_k = S_{k+1} - S_k
-    dS = S[:, 1:, :] - S[:, :-1, :]  # [paths, N, d_traded]
+    nn1.eval()
+    if controller is not None:
+        controller.eval()
 
-    # Portfolio gains: sum over time of Delta_k * dS_k
-    gains = (deltas * dS).sum(dim=-1)  # [paths, N]
-    total_gain = gains.sum(dim=-1)  # [paths]
+    with torch.no_grad():
+        V_T, info = forward_portfolio(
+            nn1, controller, features, Z_intrinsic, dS,
+            use_controller=use_controller, tbptt=0,
+        )
+    V_path = info["V_path"]
+    Delta = info.get("Delta", info.get("Delta0"))
+    return V_path, Delta, info
 
-    V_T = V0 + total_gain
-    return V_T
 
+def simulate_bsde_portfolio(model, features, S_tilde, dW, time_grid,
+                            substeps=0):
+    """Simulate portfolio using BSDE-derived deltas.
 
-def simulate_portfolio_path(
-    deltas: torch.Tensor,
-    S: torch.Tensor,
-    V0: float = 0.0,
-) -> torch.Tensor:
-    """Simulate self-financing portfolio value path.
-
-    Args:
-        deltas: Hedge ratios [paths, N, d_traded]
-        S: Stock prices [paths, N+1, d_traded]
-        V0: Initial portfolio value
+    The BSDE gives Y_path (option value) and Z (controls).
+    Delta is obtained via Z-to-Delta projection.
+    Portfolio is then: V_{k+1} = V_k + Delta_k^T * dS_k.
 
     Returns:
-        V: Portfolio value path [paths, N+1]
+        V_path: [batch, N+1] hedging portfolio path
+        Y_path: [batch, N+1] BSDE value process
+        Delta_all: [batch, N, d_traded] hedge ratios
     """
-    n_paths, N, d_traded = deltas.shape
+    model.eval()
+    with torch.no_grad():
+        Y_T, Y_path, Z_all = model(features, dW, time_grid, substeps=substeps)
+        Delta_all = model.compute_deltas(features, S_tilde, time_grid)
 
-    dS = S[:, 1:, :] - S[:, :-1, :]  # [paths, N, d_traded]
-    gains = (deltas * dS).sum(dim=-1)  # [paths, N]
+    batch, N_plus_1, d = S_tilde.shape
+    N = N_plus_1 - 1
+    dS = S_tilde[:, 1:, :] - S_tilde[:, :-1, :]
 
-    V = torch.zeros(n_paths, N + 1, device=deltas.device)
-    V[:, 0] = V0
+    V = torch.zeros(batch, device=S_tilde.device)
+    V_path_hedge = [V]
     for k in range(N):
-        V[:, k + 1] = V[:, k] + gains[:, k]
+        V = V + (Delta_all[:, k, :] * dS[:, k, :]).sum(dim=1)
+        V_path_hedge.append(V)
+    V_path_hedge = torch.stack(V_path_hedge, dim=1)
 
-    return V
+    return V_path_hedge, Y_path, Delta_all
 
 
-def compute_hedging_errors(
-    deltas: torch.Tensor,
-    S: torch.Tensor,
-    payoff_T: torch.Tensor,
-    payoff_path: Optional[torch.Tensor] = None,
-    V0: float = 0.0,
-) -> dict:
-    """Compute hedging error statistics.
-
-    Args:
-        deltas: [paths, N, d_traded]
-        S: [paths, N+1, d_traded]
-        payoff_T: Terminal payoff [paths]
-        payoff_path: Bermudan payoff process [paths, N+1] (optional)
-        V0: Initial portfolio value
+def compute_daily_pnl(V_path):
+    """Compute daily P/L: dPL_k = V_k - V_{k-1}.
 
     Returns:
-        dict with:
-            'total_error': V_T - H [paths]
-            'worst_error': min_k(V_k - Z_k) [paths] (if payoff_path given)
-            'V_T': terminal portfolio value [paths]
-            'V_path': portfolio value path [paths, N+1]
+        dPL: [batch, N] daily P/L
     """
-    V_path = simulate_portfolio_path(deltas, S, V0)
-    V_T = V_path[:, -1]
-    total_error = V_T - payoff_T
+    return V_path[:, 1:] - V_path[:, :-1]
 
-    result = {
-        'total_error': total_error,
-        'V_T': V_T,
-        'V_path': V_path,
-    }
 
-    if payoff_path is not None:
-        # Error at each exercise time
-        error_path = V_path - payoff_path  # [paths, N+1]
-        # Worst error: minimum across time (most negative = worst shortfall)
-        worst_error = error_path.min(dim=1).values  # [paths]
-        result['worst_error'] = worst_error
-        result['error_path'] = error_path
+def compute_max_drawdown(V_path):
+    """Compute max drawdown per path: max_k(max_{j<=k} V_j - V_k).
 
-    return result
+    Returns:
+        max_dd: [batch] max drawdown (positive value)
+    """
+    running_max = torch.cummax(V_path, dim=1)[0]
+    drawdown = running_max - V_path
+    return drawdown.max(dim=1)[0]

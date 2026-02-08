@@ -1,87 +1,58 @@
-"""
-Signature-like features computed without external libraries.
+"""Signature-like features (pure PyTorch, no external libraries).
 
-Implements level-1 and level-2 path signature features with no look-ahead.
-All features at time k depend only on data up to and including time k.
+Computes cumulative path statistics up to a given truncation level.
+Strictly causal: features at time k use only data up to and including time k.
 """
-
 import torch
-from typing import Optional
 
 
-def compute_signature_features(
-    S: torch.Tensor,
-    level: int = 2,
-) -> torch.Tensor:
-    """Compute signature-like features from stock price paths.
+def compute_signature_features(log_prices, level=2):
+    """Compute signature-like features up to given truncation level.
 
-    Level 1: Cumulative increments of log-prices up to time k.
-    Level 2: Cumulative pairwise products of increments up to time k.
+    Level 1: cumulative sums of increments (d features).
+    Level 2: cumulative iterated integrals of pairwise products (d*(d+1)/2 features).
 
-    All features are causal (no look-ahead).
+    NO LOOK-AHEAD: increment at time k is log_prices_k - log_prices_{k-1}.
+    At time k=0, all features are zero.
 
     Args:
-        S: Stock prices [paths, N+1, d_traded]
-        level: Signature truncation level (1 or 2)
+        log_prices: [n_paths, N+1, d] log of discounted prices
+        level: truncation level (1 or 2)
 
     Returns:
-        sig_features: [paths, N, n_sig_features]
-            At time index k (0..N-1), features use data up to time k+1
-            (i.e., increments from step 0..k are available at decision time k).
+        sig_features: [n_paths, N+1, sig_dim]
     """
-    n_paths, N_plus_1, d = S.shape
-    N = N_plus_1 - 1
+    n_paths, N_plus_1, d = log_prices.shape
 
-    # Log-prices
-    logS = torch.log(S.clamp(min=1e-8))
+    # Increments: inc_k = log_prices_k - log_prices_{k-1}, inc_0 = 0
+    increments = torch.zeros_like(log_prices)
+    increments[:, 1:, :] = log_prices[:, 1:, :] - log_prices[:, :-1, :]
 
-    # Increments: delta_k = logS_{k+1} - logS_k, for k=0..N-1
-    increments = logS[:, 1:, :] - logS[:, :-1, :]  # [paths, N, d]
-
-    features_list = []
-
-    # Level 1: cumulative sum of increments up to time k
-    # At decision time k, we use increments 0..k-1 (returns up to current time)
-    # For k=0, no increments available yet -> use zeros
-    cum_incr = torch.cumsum(increments, dim=1)  # [paths, N, d]
-    # Shift: at time k, use sum of increments 0..k-1
-    cum_incr_shifted = torch.zeros_like(cum_incr)
-    cum_incr_shifted[:, 1:, :] = cum_incr[:, :-1, :]
-    features_list.append(cum_incr_shifted)  # [paths, N, d]
-
-    # Include the most recent observed increment as a feature (no look-ahead)
-    # At decision time k, the most recent observed increment is logS_k - logS_{k-1}
-    # For k=0, no previous increment -> zeros
-    prev_incr = torch.zeros_like(increments)
-    prev_incr[:, 1:, :] = increments[:, :-1, :]
-    features_list.append(prev_incr)  # [paths, N, d]
+    # Level 1: cumulative sum of increments
+    cum_inc = torch.cumsum(increments, dim=1)  # [n_paths, N+1, d]
+    features = [cum_inc]
 
     if level >= 2:
-        # Level 2: cumulative pairwise products of increments
-        # For each pair (i, j), compute sum_{s<k} delta_s^i * delta_s^j
-        n_pairs = d * d
-        pairwise = torch.zeros(n_paths, N, n_pairs, device=S.device)
+        # Level 2: iterated integral approximation
+        # S2^{a,b}_k = sum_{j=1}^{k} cum_inc_{j-1}^a * inc_j^b
+        # This is causal: at step k it only uses data up to k
+        level2_features = []
+        for a in range(d):
+            for b in range(a, d):
+                shifted_cum = torch.zeros_like(cum_inc[:, :, a])
+                shifted_cum[:, 1:] = cum_inc[:, :-1, a]  # cum up to j-1
+                product = shifted_cum * increments[:, :, b]
+                level2 = torch.cumsum(product, dim=1)
+                level2_features.append(level2)
+        level2_tensor = torch.stack(level2_features, dim=2)
+        features.append(level2_tensor)
 
-        for i in range(d):
-            for j in range(d):
-                # Product of increments at each step
-                prod = increments[:, :, i] * increments[:, :, j]  # [paths, N]
-                cum_prod = torch.cumsum(prod, dim=1)  # [paths, N]
-                # Shift for causality
-                cum_prod_shifted = torch.zeros_like(cum_prod)
-                cum_prod_shifted[:, 1:] = cum_prod[:, :-1]
-                pairwise[:, :, i * d + j] = cum_prod_shifted
-
-        features_list.append(pairwise)
-
-    sig_features = torch.cat(features_list, dim=-1)  # [paths, N, n_features]
-    return sig_features
+    return torch.cat(features, dim=2)
 
 
-def get_signature_dim(d_traded: int, level: int = 2) -> int:
-    """Return the number of signature features for given dimension and level."""
-    # Level 1: d (cumulative) + d (current increment) = 2*d
-    dim = 2 * d_traded
+def get_signature_dim(d, level=2):
+    """Compute output dimension of signature features."""
+    dim = d  # level 1
     if level >= 2:
-        dim += d_traded * d_traded  # pairwise products
+        dim += d * (d + 1) // 2  # level 2 upper triangular pairs
     return dim

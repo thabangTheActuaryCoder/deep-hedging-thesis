@@ -1,297 +1,286 @@
-"""
-Training loop for all models (FNN-5, LSTM-5, DBSDE) with:
-- Elastic Net regularization (L1 + L2) on weights only
-- Gradient clipping
-- Early stopping
-- Optuna Bayesian HP search (TPE) over lr, l1, l2, dropout, hidden_dim
-"""
+"""Training loop for FNN/LSTM + Controller and Deep BSDE.
 
+Supports:
+- Two-stage hedger (NN1 + NN2 controller) for FNN and LSTM
+- Standalone BSDE training
+- TBPTT for LSTM portfolio propagation
+- Elastic net regularization
+- Early stopping on validation CVaR95(shortfall)
+"""
+import math
 import torch
 import torch.nn as nn
-import numpy as np
-import copy
-import optuna
-from typing import Dict, List, Optional, Tuple
+from src.training.losses import (
+    hedging_loss, bsde_loss, elastic_net_penalty,
+    shortfall, cvar, terminal_error,
+)
 from src.training.early_stopping import EarlyStopping
-from src.eval.portfolio import simulate_portfolio
-
-# Silence Optuna's per-trial INFO logs (we print our own)
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
-def elastic_net_penalty(model: nn.Module, l1_lambda: float, l2_lambda: float) -> torch.Tensor:
-    """Compute elastic net penalty on model WEIGHTS only (exclude biases, LayerNorm params)."""
-    l1_term = torch.tensor(0.0, device=next(model.parameters()).device)
-    l2_term = torch.tensor(0.0, device=next(model.parameters()).device)
+def forward_portfolio(nn1, controller, features, Z_intrinsic, dS,
+                      use_controller=True, tbptt=0):
+    """Simulate self-financing portfolio with NN1 + optional NN2 controller.
 
-    for name, param in model.named_parameters():
-        if "bias" in name or "LayerNorm" in name or "layer_norm" in name or "norm" in name.split(".")[-1]:
-            continue
-        if "Y0" in name:
-            continue
-        l1_term = l1_term + param.abs().sum()
-        l2_term = l2_term + (param ** 2).sum()
+    Discounted self-financing: V_{k+1} = V_k + Delta_k^T * dS_k
+    where dS_k = S_tilde_{k+1} - S_tilde_k.
 
-    return l1_lambda * l1_term + l2_lambda * l2_term
-
-
-def train_hedger(
-    model: nn.Module,
-    model_type: str,
-    features_train: torch.Tensor,
-    features_val: torch.Tensor,
-    S_train: torch.Tensor,
-    S_val: torch.Tensor,
-    payoff_T_train: torch.Tensor,
-    payoff_T_val: torch.Tensor,
-    dW_train: Optional[torch.Tensor] = None,
-    dW_val: Optional[torch.Tensor] = None,
-    time: Optional[torch.Tensor] = None,
-    lr: float = 1e-3,
-    l1_lambda: float = 1e-6,
-    l2_lambda: float = 1e-4,
-    epochs: int = 1000,
-    batch_size: int = 512,
-    patience: int = 30,
-    grad_clip: float = 1.0,
-    V0: float = 0.0,
-    device: str = "cpu",
-    optuna_trial: Optional[optuna.Trial] = None,
-) -> Dict:
-    """Train a hedging model.
-
-    For FNN-5 and LSTM-5:
-        Loss = MSE(V_T - H) via self-financing portfolio
-    For DBSDE:
-        Loss = MSE(Y_N - H) via BSDE propagation
-
-    If optuna_trial is provided, reports intermediate values and supports
-    pruning of unpromising trials.
+    Args:
+        nn1: baseline hedger (FNN or LSTM)
+        controller: NN2 controller (or None)
+        features: [batch, N, feat_dim] features at k=0..N-1
+        Z_intrinsic: [batch, N] intrinsic values at k=0..N-1
+        dS: [batch, N, d_traded] price increments
+        use_controller: whether to apply NN2 gating
+        tbptt: truncated BPTT length (0 = full backprop through portfolio)
 
     Returns:
-        dict with 'train_losses', 'val_losses', 'best_epoch', 'best_val_loss'
+        V_T: [batch] terminal portfolio value
+        info: dict with Delta, V_path, gate for diagnostics
     """
-    model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    early_stop = EarlyStopping(patience=patience)
+    batch, N, _ = features.shape
+    device = features.device
 
-    n_train = features_train.shape[0]
+    # NN1 baseline deltas (batched over full sequence)
+    Delta0 = nn1(features)  # [batch, N, d_traded]
 
+    if not use_controller or controller is None:
+        # Simple portfolio: no controller
+        V = torch.zeros(batch, device=device)
+        V_path = [V]
+        for k in range(N):
+            if tbptt > 0 and k > 0 and k % tbptt == 0:
+                V = V.detach()
+            V = V + (Delta0[:, k, :] * dS[:, k, :]).sum(dim=1)
+            V_path.append(V)
+        return V, {"Delta": Delta0, "V_path": torch.stack(V_path, dim=1)}
+
+    # Two-stage hedger with controller
+    V = torch.zeros(batch, device=device)
+    V_path = [V]
+    prev_V = torch.zeros_like(V)
+    running_max_V = torch.zeros_like(V)
+    dPL_buffer = []
+    gate_all = []
+
+    for k in range(N):
+        if tbptt > 0 and k > 0 and k % tbptt == 0:
+            V = V.detach()
+            prev_V = prev_V.detach()
+            running_max_V = running_max_V.detach()
+
+        # Causal P/L features at step k
+        PL_k = V                                         # cumulative P/L
+        dPL_k = (V - prev_V) if k > 0 else torch.zeros_like(V)
+        running_max_V = torch.max(running_max_V, V)
+        DD_k = V - running_max_V                         # drawdown <= 0
+        intrinsic_gap_k = V - Z_intrinsic[:, k]
+
+        dPL_buffer.append(dPL_k.detach())
+        if len(dPL_buffer) >= 2:
+            recent = torch.stack(dPL_buffer[-10:], dim=1)
+            rolling_std = recent.std(dim=1)
+        else:
+            rolling_std = torch.zeros_like(V)
+
+        pl_feats = torch.stack(
+            [PL_k, dPL_k, DD_k, intrinsic_gap_k, rolling_std], dim=1
+        )  # [batch, 5]
+
+        gate, correction = controller(features[:, k, :], pl_feats)
+        gate_all.append(gate.squeeze(1))
+
+        Delta_k = Delta0[:, k, :] + gate * correction
+        prev_V = V
+        V = V + (Delta_k * dS[:, k, :]).sum(dim=1)
+        V_path.append(V)
+
+    return V, {
+        "Delta0": Delta0,
+        "gate": torch.stack(gate_all, dim=1),
+        "V_path": torch.stack(V_path, dim=1),
+    }
+
+
+def train_hedger(nn1, controller, train_data, val_data, config, device="cpu"):
+    """Train FNN/LSTM hedger with optional controller.
+
+    Args:
+        nn1: baseline hedger model (on device)
+        controller: NN2 controller model (on device) or None
+        train_data: dict with features, Z_intrinsic, dS, H_tilde
+        val_data: dict with same keys
+        config: ExperimentConfig or dict with training params
+
+    Returns:
+        train_losses: list of per-epoch training losses
+        val_losses: list of per-epoch validation CVaR95(shortfall)
+    """
+    lr = config["lr"]
+    epochs = config["epochs"]
+    patience = config["patience"]
+    batch_size = config["batch_size"]
+    l1 = config["l1"]
+    l2 = config["l2"]
+    alpha = config["alpha"]
+    beta = config["beta"]
+    cvar_q = config["cvar_q"]
+    use_ctrl = config["use_controller"] and controller is not None
+    tbptt = config.get("tbptt", 0)
+
+    # Collect all trainable parameters
+    params = list(nn1.parameters())
+    if use_ctrl:
+        params += list(controller.parameters())
+    optimizer = torch.optim.Adam(params, lr=lr)
+
+    stopper = EarlyStopping(patience=patience, mode="min")
     train_losses = []
     val_losses = []
 
+    n_train = train_data["features"].shape[0]
+
     for epoch in range(epochs):
-        model.train()
-        perm = torch.randperm(n_train)
+        nn1.train()
+        if use_ctrl:
+            controller.train()
+
+        perm = torch.randperm(n_train, device=device)
         epoch_loss = 0.0
         n_batches = 0
 
         for i in range(0, n_train, batch_size):
             idx = perm[i:i + batch_size]
+            feat = train_data["features"][idx]
+            Z_int = train_data["Z_intrinsic"][idx]
+            ds = train_data["dS"][idx]
+            H = train_data["H_tilde"][idx]
 
-            feat_batch = features_train[idx].to(device)
-            S_batch = S_train[idx].to(device)
-            H_batch = payoff_T_train[idx].to(device)
+            V_T, _ = forward_portfolio(
+                nn1, controller, feat, Z_int, ds,
+                use_controller=use_ctrl, tbptt=tbptt,
+            )
 
-            if model_type == "bsde":
-                dW_batch = dW_train[idx].to(device)
-                Y_T, _, _ = model(feat_batch, dW_batch, time.to(device))
-                data_loss = torch.mean((Y_T - H_batch) ** 2)
-            else:
-                deltas = model.compute_deltas(feat_batch)
-                V_T = simulate_portfolio(deltas, S_batch, V0=V0)
-                data_loss = torch.mean((V_T - H_batch) ** 2)
+            loss = hedging_loss(V_T, H, alpha=alpha, beta=beta, cvar_q=cvar_q)
 
-            reg_loss = elastic_net_penalty(model, l1_lambda, l2_lambda)
-            loss = data_loss + reg_loss
+            # Elastic net on all models
+            reg = elastic_net_penalty(nn1, l1=l1, l2=l2)
+            if use_ctrl:
+                reg = reg + elastic_net_penalty(controller, l1=l1, l2=l2)
+            loss = loss + reg
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            torch.nn.utils.clip_grad_norm_(params, max_norm=10.0)
             optimizer.step()
 
-            epoch_loss += data_loss.item()
+            epoch_loss += loss.item()
             n_batches += 1
 
-        avg_train_loss = epoch_loss / max(n_batches, 1)
-        train_losses.append(avg_train_loss)
+        train_losses.append(epoch_loss / max(n_batches, 1))
 
         # Validation
-        model.eval()
-        with torch.no_grad():
-            feat_v = features_val.to(device)
-            S_v = S_val.to(device)
-            H_v = payoff_T_val.to(device)
+        val_cvar = evaluate_hedger(
+            nn1, controller, val_data, use_ctrl, tbptt, cvar_q, device
+        )
+        val_losses.append(val_cvar)
 
-            if model_type == "bsde":
-                dW_v = dW_val.to(device)
-                Y_T_val, _, _ = model(feat_v, dW_v, time.to(device))
-                val_loss = torch.mean((Y_T_val - H_v) ** 2).item()
-            else:
-                deltas_val = model.compute_deltas(feat_v)
-                V_T_val = simulate_portfolio(deltas_val, S_v, V0=V0)
-                val_loss = torch.mean((V_T_val - H_v) ** 2).item()
-
-        val_losses.append(val_loss)
-
-        if epoch % 50 == 0:
-            print(f"    Epoch {epoch:4d} | Train MSE: {avg_train_loss:.6f} | Val MSE: {val_loss:.6f}")
-
-        # Optuna pruning: kill bad trials early
-        if optuna_trial is not None:
-            optuna_trial.report(val_loss, epoch)
-            if optuna_trial.should_prune():
-                print(f"    Pruned at epoch {epoch} (val={val_loss:.4f})")
-                raise optuna.TrialPruned()
-
-        if early_stop.step(val_loss, model, epoch):
-            print(f"    Early stopping at epoch {epoch}, best epoch {early_stop.best_epoch}")
+        if stopper.step(val_cvar, nn1):
             break
 
-    early_stop.load_best(model)
-
-    return {
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'best_epoch': early_stop.best_epoch,
-        'best_val_loss': early_stop.best_score,
-    }
+    stopper.load_best(nn1)
+    return train_losses, val_losses
 
 
-# =========================================================================
-# Optuna Bayesian HP search
-# =========================================================================
+def evaluate_hedger(nn1, controller, data, use_controller, tbptt, cvar_q, device):
+    """Evaluate hedger on a dataset and return CVaR of shortfall."""
+    nn1.eval()
+    if controller is not None:
+        controller.eval()
 
-def optuna_search(
-    model_factory_fn,
-    model_type: str,
-    feature_dim: int,
-    features_train: torch.Tensor,
-    features_val: torch.Tensor,
-    S_train: torch.Tensor,
-    S_val: torch.Tensor,
-    payoff_T_train: torch.Tensor,
-    payoff_T_val: torch.Tensor,
-    dW_train: Optional[torch.Tensor] = None,
-    dW_val: Optional[torch.Tensor] = None,
-    time: Optional[torch.Tensor] = None,
-    n_trials: int = 12,
-    epochs: int = 1000,
-    batch_size: int = 512,
-    patience: int = 30,
-    V0: float = 0.0,
-    device: str = "cpu",
-    seed: int = 0,
-) -> Tuple[nn.Module, Dict, Dict, List[Dict]]:
-    """Bayesian hyperparameter search using Optuna TPE.
+    with torch.no_grad():
+        V_T, _ = forward_portfolio(
+            nn1, controller,
+            data["features"], data["Z_intrinsic"],
+            data["dS"], use_controller=use_controller, tbptt=0,
+        )
+        s = shortfall(V_T, data["H_tilde"])
+        val_cvar = cvar(s, q=cvar_q).item()
 
-    Searches over:
-        lr        : log-uniform [1e-4, 5e-3]
-        l1        : log-uniform [1e-8, 1e-4] or 0 (20% chance of 0)
-        l2        : log-uniform [1e-6, 1e-3] or 0 (15% chance of 0)
-        dropout   : uniform [0.0, 0.35]
-        hidden    : categorical {64, 96, 128, 192, 256}
+    return val_cvar
 
-    Pruning via MedianPruner: kills trials whose val loss at epoch E
-    is worse than the median of completed trials at epoch E.
+
+def train_bsde(model, train_data, val_data, config, device="cpu"):
+    """Train Deep BSDE model.
+
+    Loss: MSE(Y_N - H_tilde) + elastic net regularization.
 
     Args:
-        model_factory_fn: Callable(hidden, dropout) -> nn.Module
-        n_trials: Number of Optuna trials (12 ≈ 25+ random)
+        model: DeepBSDE model (on device)
+        train_data: dict with features, dW, H_tilde, time_grid
+        val_data: dict with same keys
+        config: dict with training params
 
     Returns:
-        best_model, best_result, best_hparams, all_trials
+        train_losses: list of per-epoch losses
+        val_losses: list of per-epoch validation CVaR95(shortfall)
     """
-    best_model_state = [None]
-    best_model_obj = [None]
-    best_result_holder = [None]
-    all_trials = []
+    lr = config["lr"]
+    epochs = config["epochs"]
+    patience = config["patience"]
+    batch_size = config["batch_size"]
+    l1 = config["l1"]
+    l2 = config["l2"]
+    cvar_q = config["cvar_q"]
+    substeps = config.get("substeps", 0)
+    time_grid = train_data["time_grid"]
 
-    def objective(trial: optuna.Trial) -> float:
-        # --- Sample hyperparameters ---
-        lr = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    stopper = EarlyStopping(patience=patience, mode="min")
+    train_losses = []
+    val_losses = []
 
-        use_l1 = trial.suggest_categorical("use_l1", [True, False])
-        l1 = trial.suggest_float("l1", 1e-8, 1e-4, log=True) if use_l1 else 0.0
+    n_train = train_data["features"].shape[0]
 
-        use_l2 = trial.suggest_categorical("use_l2", [True, False])
-        l2 = trial.suggest_float("l2", 1e-6, 1e-3, log=True) if use_l2 else 0.0
+    for epoch in range(epochs):
+        model.train()
+        perm = torch.randperm(n_train, device=device)
+        epoch_loss = 0.0
+        n_batches = 0
 
-        dropout = trial.suggest_float("dropout", 0.0, 0.35)
-        hidden = trial.suggest_categorical("hidden", [64, 96, 128, 192, 256])
+        for i in range(0, n_train, batch_size):
+            idx = perm[i:i + batch_size]
+            feat = train_data["features"][idx]
+            dw = train_data["dW"][idx]
+            H = train_data["H_tilde"][idx]
 
-        hp = {'lr': lr, 'l1': l1, 'l2': l2, 'dropout': round(dropout, 3), 'hidden': hidden}
-        trial_num = trial.number + 1
-        print(f"\n  Trial {trial_num}/{n_trials} | "
-              f"lr={lr:.2e}  l1={l1:.2e}  l2={l2:.2e}  "
-              f"drop={dropout:.3f}  hidden={hidden}")
+            Y_T, _, _ = model(feat, dw, time_grid, substeps=substeps)
+            loss = bsde_loss(Y_T, H) + elastic_net_penalty(model, l1=l1, l2=l2)
 
-        torch.manual_seed(seed)
-        model = model_factory_fn(hidden=hidden, dropout=dropout)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            optimizer.step()
 
-        result = train_hedger(
-            model=model,
-            model_type=model_type,
-            features_train=features_train,
-            features_val=features_val,
-            S_train=S_train, S_val=S_val,
-            payoff_T_train=payoff_T_train,
-            payoff_T_val=payoff_T_val,
-            dW_train=dW_train, dW_val=dW_val,
-            time=time,
-            lr=lr, l1_lambda=l1, l2_lambda=l2,
-            epochs=epochs, batch_size=batch_size,
-            patience=patience, V0=V0, device=device,
-            optuna_trial=trial,
-        )
+            epoch_loss += loss.item()
+            n_batches += 1
 
-        val_mse = result['best_val_loss']
-        trial_record = {**hp, 'val_loss': val_mse, 'best_epoch': result['best_epoch']}
-        all_trials.append(trial_record)
+        train_losses.append(epoch_loss / max(n_batches, 1))
 
-        # Keep track of the actual best model object
-        if best_model_state[0] is None or val_mse < best_result_holder[0]['best_val_loss']:
-            best_model_state[0] = copy.deepcopy(model.state_dict())
-            best_model_obj[0] = model
-            best_result_holder[0] = result
-            print(f"    -> New best! Val MSE: {val_mse:.6f}  (epoch {result['best_epoch']})")
-        else:
-            print(f"    Val MSE: {val_mse:.6f}  (best so far: {best_result_holder[0]['best_val_loss']:.6f})")
+        # Validation: compute CVaR95(shortfall) using BSDE terminal value as V_T
+        val_cvar = evaluate_bsde(model, val_data, time_grid, cvar_q, substeps, device)
+        val_losses.append(val_cvar)
 
-        return val_mse
+        if stopper.step(val_cvar, model):
+            break
 
-    # Create study with TPE sampler + median pruner
-    sampler = optuna.samplers.TPESampler(seed=seed + 7919)
-    pruner = optuna.pruners.MedianPruner(
-        n_startup_trials=3,    # Don't prune first 3 trials (need baseline)
-        n_warmup_steps=20,     # Don't prune before epoch 20
-    )
-    study = optuna.create_study(
-        direction="minimize",
-        sampler=sampler,
-        pruner=pruner,
-    )
-    study.optimize(objective, n_trials=n_trials)
+    stopper.load_best(model)
+    return train_losses, val_losses
 
-    # Extract best
-    best_trial = study.best_trial
-    best_hparams = {
-        'lr': best_trial.params['lr'],
-        'l1': best_trial.params.get('l1', 0.0) if best_trial.params.get('use_l1', False) else 0.0,
-        'l2': best_trial.params.get('l2', 0.0) if best_trial.params.get('use_l2', False) else 0.0,
-        'dropout': round(best_trial.params['dropout'], 3),
-        'hidden': best_trial.params['hidden'],
-    }
 
-    # Rebuild best model with saved state
-    best_model = model_factory_fn(hidden=best_hparams['hidden'],
-                                  dropout=best_hparams['dropout'])
-    best_model.load_state_dict(best_model_state[0])
-    best_model.eval()
-
-    n_pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
-    n_complete = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-    print(f"\n  Search done: {n_complete} completed, {n_pruned} pruned")
-    print(f"  Best config: {best_hparams}  |  Val MSE: {best_trial.value:.6f}")
-
-    return best_model, best_result_holder[0], best_hparams, all_trials
+def evaluate_bsde(model, data, time_grid, cvar_q, substeps, device):
+    """Evaluate BSDE model, return CVaR of shortfall."""
+    model.eval()
+    with torch.no_grad():
+        Y_T, _, _ = model(data["features"], data["dW"], time_grid, substeps=substeps)
+        s = shortfall(Y_T, data["H_tilde"])
+        return cvar(s, q=cvar_q).item()

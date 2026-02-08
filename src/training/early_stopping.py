@@ -1,48 +1,53 @@
-"""
-Early stopping with patience for validation-based model selection.
-"""
+"""Early stopping with best-model checkpointing.
 
-import torch
+Monitors validation CVaR95(shortfall) and stops training
+when no improvement is seen for `patience` consecutive epochs.
+"""
 import copy
-from typing import Optional
 
 
 class EarlyStopping:
-    """Early stopping based on validation metric (lower is better)."""
-
-    def __init__(self, patience: int = 10, min_delta: float = 0.0):
+    def __init__(self, patience=10, mode="min"):
+        """
+        Args:
+            patience: epochs without improvement before stopping
+            mode: 'min' to minimize metric, 'max' to maximize
+        """
         self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
+        self.mode = mode
         self.best_score = None
+        self.counter = 0
         self.best_state = None
-        self.best_epoch = 0
         self.should_stop = False
 
-    def step(self, val_metric: float, model: torch.nn.Module, epoch: int) -> bool:
-        """Check if training should stop.
-
-        Args:
-            val_metric: Validation metric (lower is better)
-            model: Current model
-            epoch: Current epoch
+    def step(self, score, model):
+        """Check if score improved; checkpoint if so.
 
         Returns:
-            True if should stop
+            True if training should stop, False otherwise
         """
-        if self.best_score is None or val_metric < self.best_score - self.min_delta:
-            self.best_score = val_metric
+        if self.best_score is None:
+            self.best_score = score
             self.best_state = copy.deepcopy(model.state_dict())
-            self.best_epoch = epoch
+            return False
+
+        improved = (
+            (score < self.best_score) if self.mode == "min"
+            else (score > self.best_score)
+        )
+
+        if improved:
+            self.best_score = score
+            self.best_state = copy.deepcopy(model.state_dict())
             self.counter = 0
         else:
             self.counter += 1
             if self.counter >= self.patience:
                 self.should_stop = True
-                return True
-        return False
 
-    def load_best(self, model: torch.nn.Module):
-        """Load best model state."""
+        return self.should_stop
+
+    def load_best(self, model):
+        """Restore best checkpoint into model."""
         if self.best_state is not None:
             model.load_state_dict(self.best_state)

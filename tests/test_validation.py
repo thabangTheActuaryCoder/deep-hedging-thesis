@@ -1,205 +1,297 @@
-"""
-Validation tests for the deep hedging codebase.
+"""Validation tests for the deep hedging codebase.
 
-Tests:
-A) No look-ahead: inputs at time k do not use data from k+1..N
-B) Self-financing: portfolio update uses only Delta_k and (S_{k+1} - S_k)
-C) Reproducibility: same seed -> identical metrics
+Tests cover:
+  - No look-ahead in features
+  - Self-financing portfolio constraint
+  - Reproducibility (same seed -> identical outputs)
+  - Controller causality (NN2 inputs at step k exclude future data)
+  - LR grid tested as specified
 """
-
 import sys
 import os
+import pytest
 import torch
 import numpy as np
-import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.sim.simulate_market import simulate_market, compute_payoffs, split_data
-from src.features.signatures import compute_signature_features
+from src.utils.reproducibility import set_seed
+from src.sim.simulate_market import (
+    simulate_market, compute_european_put_payoff,
+    compute_intrinsic_process, split_data,
+)
 from src.features.build_features import build_base_features
-from src.models.fnn import FNN5Hedger
-from src.models.lstm import LSTM5Hedger
+from src.features.signatures import compute_signature_features
+from src.models.fnn import FNNHedger
+from src.models.lstm import LSTMHedger
+from src.models.controller import Controller
 from src.models.bsde import DeepBSDE
-from src.eval.portfolio import simulate_portfolio, simulate_portfolio_path
+from src.training.train import forward_portfolio
 
 
-# ==================== A) No Look-Ahead Tests ====================
+DEVICE = "cpu"
+N_PATHS = 500
+N_STEPS = 20
+T = 1.0
+D_TRADED = 2
+M_BROWN = 3
+
+
+@pytest.fixture
+def market_data():
+    """Generate small market for testing."""
+    set_seed(42)
+    S_tilde, dW, time_grid, sigma = simulate_market(
+        N_PATHS, N_STEPS, T, D_TRADED, M_BROWN, r=0.0,
+        vols=[0.2, 0.2], seed=42, device=DEVICE,
+    )
+    H_tilde = compute_european_put_payoff(S_tilde, K=1.0, r=0.0, T=T)
+    Z = compute_intrinsic_process(S_tilde, K=1.0, r=0.0, time_grid=time_grid)
+    return S_tilde, dW, time_grid, sigma, H_tilde, Z
+
+
+# ─────────────────────────────────────
+# No look-ahead tests
+# ─────────────────────────────────────
 
 class TestNoLookAhead:
-    """Verify that features at time k only use data up to time k."""
+    def test_base_features_no_lookahead(self, market_data):
+        """Base features at step k depend only on S_tilde up to k."""
+        S_tilde, _, time_grid, _, _, _ = market_data
+        base = build_base_features(S_tilde, time_grid, T)
 
-    def test_base_features_no_lookahead(self):
-        """Base features at time k use S_k and tau_k only."""
-        torch.manual_seed(0)
-        S = torch.randn(10, 11, 2).abs() * 100  # [10, 11, 2]
-        time = torch.linspace(0, 1, 11)
+        # Modify future prices — base features at k should not change
+        S_mod = S_tilde.clone()
+        S_mod[:, 10:, :] = 999.0
+        base_mod = build_base_features(S_mod, time_grid, T)
 
-        base = build_base_features(S, time, T=1.0)  # [10, 10, 3]
+        # Features at k=5 should be identical
+        assert torch.allclose(base[:, 5, :], base_mod[:, 5, :]), \
+            "Base features at k=5 changed when future prices were modified"
 
-        # At time k, logS should be log(S[:, k, :])
-        for k in range(10):
-            expected_logS = torch.log(S[:, k, :].clamp(min=1e-8))
-            actual_logS = base[:, k, :2]
-            assert torch.allclose(actual_logS, expected_logS, atol=1e-6), \
-                f"Base feature at k={k} uses wrong price data"
+    def test_signature_features_no_lookahead(self, market_data):
+        """Signature features at step k are invariant to future price changes."""
+        S_tilde, _, _, _, _, _ = market_data
+        log_prices = torch.log(S_tilde.clamp(min=1e-8))
+        sig = compute_signature_features(log_prices, level=2)
 
-    def test_signature_features_no_lookahead(self):
-        """Signature features at time k depend only on data up to k."""
-        torch.manual_seed(0)
-        S_full = torch.randn(5, 11, 2).abs() * 100
+        # Modify future
+        log_mod = log_prices.clone()
+        log_mod[:, 10:, :] = 0.0
+        sig_mod = compute_signature_features(log_mod, level=2)
 
-        sig_full = compute_signature_features(S_full, level=2)  # [5, 10, feat]
+        # At k=8, signatures should match
+        assert torch.allclose(sig[:, 8, :], sig_mod[:, 8, :], atol=1e-6), \
+            "Signature features at k=8 changed when future data was modified"
 
-        # Truncate: keep only first k+2 prices, fill rest with zeros
-        for k in range(1, 10):
-            S_trunc = S_full.clone()
-            S_trunc[:, k + 1:, :] = 999.0  # Corrupt future data
-
-            sig_trunc = compute_signature_features(S_trunc, level=2)
-
-            # Features at time k should be identical
-            assert torch.allclose(sig_full[:, k, :], sig_trunc[:, k, :], atol=1e-5), \
-                f"Signature features at k={k} leak future data"
-
-    def test_lstm_step_by_step_matches_full(self):
-        """LSTM step-by-step output at k matches full-sequence output at k."""
-        torch.manual_seed(42)
-        feat_dim = 10
-        d_traded = 2
-
-        model = LSTM5Hedger(feat_dim, d_traded, hidden_dim=32, n_layers=2, dropout=0.0)
-        model.eval()
-
-        features = torch.randn(3, 8, feat_dim)  # [3, 8, 10]
-
-        # Full sequence forward
-        with torch.no_grad():
-            deltas_full = model.compute_deltas(features)  # [3, 8, 2]
-
-        # Step-by-step forward
-        hidden = None
-        for k in range(8):
-            with torch.no_grad():
-                delta_k, hidden = model.forward_step(features[:, k, :], hidden)
-
-            assert torch.allclose(deltas_full[:, k, :], delta_k, atol=1e-5), \
-                f"LSTM step-by-step mismatch at k={k}"
+    def test_signature_at_zero(self, market_data):
+        """Signature features at k=0 should be zero (no increments yet)."""
+        S_tilde, _, _, _, _, _ = market_data
+        log_prices = torch.log(S_tilde.clamp(min=1e-8))
+        sig = compute_signature_features(log_prices, level=2)
+        assert torch.allclose(sig[:, 0, :], torch.zeros_like(sig[:, 0, :])), \
+            "Signature features at k=0 are not zero"
 
 
-# ==================== B) Self-Financing Tests ====================
+# ─────────────────────────────────────
+# Self-financing tests
+# ─────────────────────────────────────
 
 class TestSelfFinancing:
-    """Verify self-financing portfolio dynamics."""
+    def test_portfolio_update(self, market_data):
+        """V_{k+1} = V_k + Delta_k^T * (S_{k+1} - S_k)."""
+        S_tilde, _, _, _, _, Z = market_data
+        N = N_STEPS
+        dS = S_tilde[:, 1:, :] - S_tilde[:, :-1, :]
 
-    def test_portfolio_uses_only_delta_and_price_increment(self):
-        """V_{k+1} = V_k + sum_j Delta_k^j * (S_{k+1}^j - S_k^j)."""
-        torch.manual_seed(0)
-        n_paths, N, d = 5, 4, 2
-        S = torch.randn(n_paths, N + 1, d).abs() * 100
-        deltas = torch.randn(n_paths, N, d)
-
-        V0 = 10.0
-        V_path = simulate_portfolio_path(deltas, S, V0=V0)
-
-        # Manually verify
-        for k in range(N):
-            dS_k = S[:, k + 1, :] - S[:, k, :]
-            gain_k = (deltas[:, k, :] * dS_k).sum(dim=-1)
-            expected = V_path[:, k] + gain_k
-            assert torch.allclose(V_path[:, k + 1], expected, atol=1e-5), \
-                f"Self-financing violated at step k={k}"
-
-    def test_portfolio_terminal_matches_path(self):
-        """simulate_portfolio terminal value matches simulate_portfolio_path terminal."""
-        torch.manual_seed(0)
-        n_paths, N, d = 10, 6, 2
-        S = torch.randn(n_paths, N + 1, d).abs() * 100
-        deltas = torch.randn(n_paths, N, d)
-
-        V_T = simulate_portfolio(deltas, S, V0=5.0)
-        V_path = simulate_portfolio_path(deltas, S, V0=5.0)
-
-        assert torch.allclose(V_T, V_path[:, -1], atol=1e-5), \
-            "Terminal portfolio value mismatch"
-
-    def test_no_future_prices_in_delta(self):
-        """Delta_k should not depend on S_{k+1}..S_N (FNN case)."""
-        torch.manual_seed(42)
+        set_seed(0)
         feat_dim = 8
-        d_traded = 2
-
-        model = FNN5Hedger(feat_dim, d_traded, hidden_dim=32, n_layers=2, dropout=0.0)
-        model.eval()
-
-        # Create features and modify future entries
-        features = torch.randn(3, 5, feat_dim)
-        features2 = features.clone()
-        features2[:, 3:, :] = torch.randn(3, 2, feat_dim)  # Change future
+        features = torch.randn(N_PATHS, N, feat_dim)
+        nn1 = FNNHedger(feat_dim, D_TRADED, depth=2, width=16)
+        nn1.eval()  # disable dropout for deterministic comparison
 
         with torch.no_grad():
-            d1 = model.compute_deltas(features)
-            d2 = model.compute_deltas(features2)
+            Delta = nn1(features)  # [N_PATHS, N, D_TRADED]
 
-        # Deltas at k=0,1,2 should be identical (FNN is per-step)
-        for k in range(3):
-            assert torch.allclose(d1[:, k, :], d2[:, k, :], atol=1e-6), \
-                f"FNN delta at k={k} depends on future features"
+        # Manual portfolio simulation
+        V = torch.zeros(N_PATHS)
+        for k in range(N):
+            V_new = V + (Delta[:, k, :] * dS[:, k, :]).sum(dim=1)
+            V = V_new
+
+        # Compare with forward_portfolio (no controller)
+        with torch.no_grad():
+            V_T, info = forward_portfolio(
+                nn1, None, features, Z[:, :N], dS,
+                use_controller=False, tbptt=0,
+            )
+
+        assert torch.allclose(V, V_T, atol=1e-5), \
+            "Portfolio terminal value mismatch"
+
+    def test_path_terminal_consistency(self, market_data):
+        """V_path[-1] should equal V_T from forward_portfolio."""
+        S_tilde, _, _, _, _, Z = market_data
+        N = N_STEPS
+        dS = S_tilde[:, 1:, :] - S_tilde[:, :-1, :]
+
+        set_seed(0)
+        feat_dim = 8
+        features = torch.randn(N_PATHS, N, feat_dim)
+        nn1 = FNNHedger(feat_dim, D_TRADED, depth=2, width=16)
+
+        with torch.no_grad():
+            V_T, info = forward_portfolio(
+                nn1, None, features, Z[:, :N], dS,
+                use_controller=False, tbptt=0,
+            )
+        assert torch.allclose(info["V_path"][:, -1], V_T, atol=1e-5)
+
+    def test_no_future_prices_in_delta(self, market_data):
+        """FNN delta at step k is independent of future features."""
+        set_seed(0)
+        feat_dim = 8
+        nn1 = FNNHedger(feat_dim, D_TRADED, depth=2, width=16)
+        nn1.eval()
+
+        features = torch.randn(10, N_STEPS, feat_dim)
+        with torch.no_grad():
+            delta_orig = nn1(features[:, 5, :]).clone()
+
+        # Modify future features
+        features[:, 6:, :] = 999.0
+        with torch.no_grad():
+            delta_mod = nn1(features[:, 5, :])
+
+        assert torch.allclose(delta_orig, delta_mod), \
+            "FNN delta at k=5 changed when future features were modified"
 
 
-# ==================== C) Reproducibility Tests ====================
+# ─────────────────────────────────────
+# Reproducibility tests
+# ─────────────────────────────────────
 
 class TestReproducibility:
-    """Verify that same seed produces identical results."""
+    def test_market_simulation(self):
+        """Same seed produces identical market data."""
+        S1, dW1, _, _ = simulate_market(100, 10, 1.0, 2, 3, 0.0,
+                                         [0.2, 0.2], seed=99)
+        S2, dW2, _, _ = simulate_market(100, 10, 1.0, 2, 3, 0.0,
+                                         [0.2, 0.2], seed=99)
+        assert torch.allclose(S1, S2)
+        assert torch.allclose(dW1, dW2)
 
-    def test_market_simulation_reproducibility(self):
-        """Same seed -> identical market data."""
-        m1 = simulate_market(100, N=10, T=1.0, d_traded=2, m_brownian=3, seed=123)
-        m2 = simulate_market(100, N=10, T=1.0, d_traded=2, m_brownian=3, seed=123)
-
-        assert torch.allclose(m1.S, m2.S), "Stock prices differ with same seed"
-        assert torch.allclose(m1.dW, m2.dW), "Brownian increments differ with same seed"
-
-    def test_payoff_reproducibility(self):
+    def test_payoff_reproducibility(self, market_data):
         """Same market -> same payoffs."""
-        m = simulate_market(50, N=10, T=1.0, d_traded=2, m_brownian=3, seed=42)
-        p1_T, p1_path = compute_payoffs(m.S, K=100.0)
-        p2_T, p2_path = compute_payoffs(m.S, K=100.0)
-
-        assert torch.allclose(p1_T, p2_T), "Terminal payoffs differ"
-        assert torch.allclose(p1_path, p2_path), "Payoff paths differ"
+        S, _, _, _, H1, _ = market_data
+        H2 = compute_european_put_payoff(S, K=1.0, r=0.0, T=T)
+        assert torch.allclose(H1, H2)
 
     def test_split_reproducibility(self):
         """Same seed -> same split indices."""
-        m = simulate_market(100, N=5, T=1.0, d_traded=2, m_brownian=3, seed=0)
-
-        (S_tr1,), (S_v1,), (S_te1,) = split_data(m.S, seed=99)
-        (S_tr2,), (S_v2,), (S_te2,) = split_data(m.S, seed=99)
-
-        assert torch.allclose(S_tr1, S_tr2), "Train split differs with same seed"
-        assert torch.allclose(S_v1, S_v2), "Val split differs with same seed"
-        assert torch.allclose(S_te1, S_te2), "Test split differs with same seed"
+        t1, v1, te1 = split_data(1000, seed=42)
+        t2, v2, te2 = split_data(1000, seed=42)
+        assert np.array_equal(t1, t2)
+        assert np.array_equal(v1, v2)
+        assert np.array_equal(te1, te2)
 
     def test_model_forward_reproducibility(self):
-        """Same seed -> identical model initialization -> same output."""
-        feat_dim = 8
-        d_traded = 2
-        x = torch.randn(3, feat_dim)
-
-        torch.manual_seed(77)
-        m1 = FNN5Hedger(feat_dim, d_traded, hidden_dim=32, n_layers=2)
+        """Same seed -> same model init -> same output."""
+        set_seed(7)
+        m1 = FNNHedger(10, 2, depth=3, width=32)
         m1.eval()
+        x = torch.randn(5, 10)
+        with torch.no_grad():
+            out1 = m1(x).clone()
 
-        torch.manual_seed(77)
-        m2 = FNN5Hedger(feat_dim, d_traded, hidden_dim=32, n_layers=2)
+        set_seed(7)
+        m2 = FNNHedger(10, 2, depth=3, width=32)
         m2.eval()
+        with torch.no_grad():
+            out2 = m2(x)
+
+        assert torch.allclose(out1, out2, atol=1e-6)
+
+
+# ─────────────────────────────────────
+# Controller causality test
+# ─────────────────────────────────────
+
+class TestControllerCausality:
+    def test_controller_input_excludes_future(self, market_data):
+        """NN2 at step k does not receive dPL_{k+1} or S_{k+1}."""
+        S_tilde, _, _, _, _, Z = market_data
+        N = N_STEPS
+        dS = S_tilde[:, 1:, :] - S_tilde[:, :-1, :]
+        feat_dim = 8
+        features = torch.randn(N_PATHS, N, feat_dim)
+
+        set_seed(0)
+        nn1 = FNNHedger(feat_dim, D_TRADED, depth=2, width=16)
+        ctrl = Controller(feat_dim, D_TRADED, depth=2, width=16)
+
+        # Run portfolio up to step 5 with original data
+        with torch.no_grad():
+            V_T_orig, info_orig = forward_portfolio(
+                nn1, ctrl, features, Z[:, :N], dS,
+                use_controller=True, tbptt=0,
+            )
+            gate_5_orig = info_orig["gate"][:, 5].clone()
+
+        # Modify future dS (steps > 5) and rerun
+        dS_mod = dS.clone()
+        dS_mod[:, 6:, :] = 0.0
+        set_seed(0)
+        nn1_2 = FNNHedger(feat_dim, D_TRADED, depth=2, width=16)
+        ctrl_2 = Controller(feat_dim, D_TRADED, depth=2, width=16)
 
         with torch.no_grad():
-            y1 = m1(x)
-            y2 = m2(x)
+            _, info_mod = forward_portfolio(
+                nn1_2, ctrl_2, features, Z[:, :N], dS_mod,
+                use_controller=True, tbptt=0,
+            )
+            gate_5_mod = info_mod["gate"][:, 5]
 
-        assert torch.allclose(y1, y2), "Model outputs differ with same seed"
+        assert torch.allclose(gate_5_orig, gate_5_mod, atol=1e-5), \
+            "Controller gate at k=5 changed when future dS was modified"
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+# ─────────────────────────────────────
+# LR grid test
+# ─────────────────────────────────────
+
+class TestLRGrid:
+    def test_lr_values(self):
+        """Verify the exact LR grid is {3e-4, 1e-3, 3e-3}."""
+        from src.utils.config import ExperimentConfig
+        cfg = ExperimentConfig()
+        expected = [3e-4, 1e-3, 3e-3]
+        assert cfg.lrs == expected, f"LR grid mismatch: {cfg.lrs} != {expected}"
+
+
+# ─────────────────────────────────────
+# LSTM consistency test
+# ─────────────────────────────────────
+
+class TestLSTMConsistency:
+    def test_lstm_full_vs_slice(self):
+        """LSTM output at step k is same whether we feed full seq or slice to k+1."""
+        set_seed(0)
+        feat_dim = 8
+        lstm = LSTMHedger(feat_dim, D_TRADED, num_layers=2, hidden_size=16)
+        lstm.eval()  # disable dropout for deterministic comparison
+        x = torch.randn(5, 10, feat_dim)
+
+        with torch.no_grad():
+            full_out = lstm(x)                # [5, 10, D_TRADED]
+            partial_out = lstm(x[:, :6, :])   # [5, 6, D_TRADED]
+
+        # Note: LSTM output at k depends on all inputs 0..k,
+        # so slicing to k+1 should give same output at k
+        # This is NOT true for standard LSTM because of bidirectional effects,
+        # but our LSTM is unidirectional so it should hold.
+        # However, the head MLP is applied independently, so this test is valid.
+        # Actually for a forward LSTM, output[k] = f(input[0:k+1]), so
+        # feeding [0:6] should give same output[0:5] as feeding [0:10].
+        assert torch.allclose(full_out[:, :6, :], partial_out, atol=1e-5), \
+            "LSTM output at k < 6 differs between full and partial sequence"

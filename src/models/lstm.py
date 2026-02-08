@@ -1,90 +1,72 @@
-"""
-LSTM-5 Hedger: 5-layer stacked LSTM for sequential delta hedging.
+"""LSTM baseline hedger (NN1).
 
-Architecture:
-- Input: feature sequence [batch, seq_len, feature_dim]
-- 5-layer stacked LSTM with hidden_size=128, dropout=0.1 between layers
-- Linear output head: hidden -> Delta_k in R^{d_traded}
+Single forward pass over the entire sequence (no Python loop for outputs).
+Pre-MLP and head-MLP use the activation schedule.
 """
-
 import torch
 import torch.nn as nn
+from src.models.fnn import get_activation
 
 
-class LSTM5Hedger(nn.Module):
-    """Stacked LSTM hedger with 5 layers.
+class LSTMHedger(nn.Module):
+    """LSTM-based baseline hedger.
 
-    Processes the feature sequence up to time k and outputs Delta_k.
-    Uses the LSTM hidden state at each time step for sequential hedging.
+    Input: full feature sequence [batch, N, feat_dim]
+    Output: hedge ratios [batch, N, d_traded] via single forward pass
     """
 
-    def __init__(
-        self,
-        input_dim: int,
-        d_traded: int,
-        hidden_dim: int = 128,
-        n_layers: int = 5,
-        dropout: float = 0.1,
-    ):
+    def __init__(self, input_dim, d_traded, num_layers=5, hidden_size=128,
+                 act_schedule="relu_all", dropout=0.1):
         super().__init__()
-        self.input_dim = input_dim
-        self.d_traded = d_traded
-        self.hidden_dim = hidden_dim
-        self.n_layers = n_layers
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
 
-        self.lstm = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
-            num_layers=n_layers,
-            batch_first=True,
-            dropout=dropout if n_layers > 1 else 0.0,
+        # Pre-MLP: project features to hidden_size
+        self.pre_mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_size),
+            nn.LayerNorm(hidden_size),
+            get_activation(act_schedule, 0),
         )
 
-        self.output_head = nn.Linear(hidden_dim, d_traded)
+        # Stacked LSTM
+        self.lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Process full sequence and output deltas at each time step.
+        # Head MLP: map LSTM output to hedge ratios
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            get_activation(act_schedule, 1),
+            nn.Linear(hidden_size, d_traded),
+        )
 
-        Args:
-            x: Feature sequence [batch, N, feature_dim]
-
-        Returns:
-            deltas: Hedge ratios [batch, N, d_traded]
-        """
-        # LSTM output: [batch, N, hidden_dim]
-        lstm_out, _ = self.lstm(x)
-        # Apply output head at each time step
-        deltas = self.output_head(lstm_out)  # [batch, N, d_traded]
-        return deltas
-
-    def compute_deltas(self, features: torch.Tensor) -> torch.Tensor:
-        """Compute hedge ratios for all time steps (same as forward).
-
-        Args:
-            features: [paths, N, feature_dim]
-
-        Returns:
-            deltas: [paths, N, d_traded]
-        """
-        return self.forward(features)
-
-    def forward_step(
-        self,
-        x_k: torch.Tensor,
-        hidden: tuple = None,
-    ) -> tuple:
-        """Process a single time step (for validation/testing).
+    def forward(self, x):
+        """Single forward pass over full sequence.
 
         Args:
-            x_k: Features at time k [batch, feature_dim]
-            hidden: LSTM hidden state tuple (h, c)
+            x: [batch, N, feat_dim]
 
         Returns:
-            delta_k: Hedge ratio [batch, d_traded]
-            hidden: Updated LSTM state
+            delta: [batch, N, d_traded]
         """
-        # Add sequence dimension: [batch, 1, feature_dim]
-        x_k = x_k.unsqueeze(1)
-        lstm_out, hidden = self.lstm(x_k, hidden)
-        delta_k = self.output_head(lstm_out.squeeze(1))
-        return delta_k, hidden
+        h = self.pre_mlp(x)        # [batch, N, hidden]
+        output, _ = self.lstm(h)    # [batch, N, hidden]
+        delta = self.head(output)   # [batch, N, d_traded]
+        return delta
+
+    def forward_with_states(self, x):
+        """Forward pass that also returns LSTM hidden states (for diagnostics).
+
+        Returns:
+            delta: [batch, N, d_traded]
+            (h_n, c_n): final hidden and cell states
+        """
+        h = self.pre_mlp(x)
+        output, states = self.lstm(h)
+        delta = self.head(output)
+        return delta, states
