@@ -6,10 +6,12 @@ $e_T$ = terminal error, $s$ = shortfall, $Z$ = intrinsic process.
 
 ---
 
-## Algorithm 1: Incomplete Market Simulation (Log-Euler Scheme)
+## Algorithm 1: GBM Market Simulation (Log-Euler Scheme, Calibrated)
 
 **Input:** $n$ paths, $N$ time steps, maturity $T$, $d$ traded assets, $m$ Brownian drivers ($m > d$),
-volatilities $\{\sigma_i\}_{i=1}^d$, extra loading $\sigma_{\text{extra}}$, risk-free rate $r$, strike $K$.
+calibrated volatilities $\{\sigma_i\}_{i=1}^d$, extra loading $\sigma_{\text{extra}}$, risk-free rate $r$, strike $K$.
+
+**Calibrated defaults** (S\&P 500, Jan 2026): $r = 0.043$, $\sigma = [0.18, 0.22]$, $\sigma_{\text{extra}} = 0.06$, $K = 1.0$, $T = 1.0$.
 
 1. Build diffusion matrix $\sigma \in \mathbb{R}^{d \times m}$:
    - $\sigma_{i,i} = \text{vol}_i$ for $i = 1, \dots, d$
@@ -27,13 +29,51 @@ volatilities $\{\sigma_i\}_{i=1}^d$, extra loading $\sigma_{\text{extra}}$, risk
 
 ---
 
-## Algorithm 2: Feature Construction
+## Algorithm 2: Heston Stochastic Volatility Simulation (Euler-Maruyama)
+
+**Input:** $n$ paths, $N$ time steps, maturity $T$, $d$ traded assets, Heston parameters
+$\{\kappa_i, \theta_i, \xi_i, \rho_i, v_0^i\}_{i=1}^d$, extra loading $\sigma_{\text{extra}}$, risk-free rate $r$, strike $K$.
+
+**Calibrated defaults** (S\&P 500, Jan 2026): $r = 0.043$, $\kappa = [2.0, 2.0]$, $\theta = [0.04, 0.05]$,
+$\xi = [0.3, 0.35]$, $\rho = [-0.7, -0.65]$, $v_0 = [0.04, 0.05]$.
+
+**Dynamics** for each asset $i$:
+$$dS_i = r \, S_i \, dt + \sqrt{v_i} \, S_i \, dW_i^S$$
+$$dv_i = \kappa_i (\theta_i - v_i) \, dt + \xi_i \sqrt{v_i} \, dW_i^v$$
+$$\text{corr}(dW_i^S, dW_i^v) = \rho_i$$
+
+**Brownian structure:** $m = 2d + \mathbb{1}[\sigma_{\text{extra}} > 0]$ drivers.
+Columns: $W_1^S, W_1^v, W_2^S, W_2^v, \dots, W_{\text{extra}}$.
+
+1. Set $\Delta t = T / N$, $\tilde{S}_0^i = 1$, $v_0^i$ from parameters
+2. Generate independent standard normals $Z \in \mathbb{R}^{n \times N \times m}$
+3. Apply Cholesky correlation for each asset $i$:
+   - $\Delta W_i^S = Z_{2i} \cdot \sqrt{\Delta t}$
+   - $\Delta W_i^v = \bigl(\rho_i \, Z_{2i} + \sqrt{1 - \rho_i^2} \, Z_{2i+1}\bigr) \cdot \sqrt{\Delta t}$
+4. **for** $k = 0, 1, \dots, N-1$ **do**
+   - **for** each asset $i = 1, \dots, d$ **do**
+     - $\sqrt{v} \leftarrow \sqrt{\max(v_k^i, 0)}$
+     - Variance: $v_{k+1}^i = |v_k^i + \kappa_i (\theta_i - v_k^i) \Delta t + \xi_i \sqrt{v} \, \Delta W_{k,i}^v|$ (reflection)
+     - Price: $\log(\tilde{S}_{k+1}^i / \tilde{S}_k^i) = -\tfrac{1}{2} v_k^i \, \Delta t + \sqrt{v} \, \Delta W_{k,i}^S + \sigma_{\text{extra}} \, \Delta W_{k}^{\text{extra}}$
+5. Build effective diffusion matrix $\bar{\sigma} \in \mathbb{R}^{d \times m}$:
+   - $\bar{\sigma}_{i, 2i} = \sqrt{\theta_i}$ (long-run vol approximation)
+   - $\bar{\sigma}_{i, -1} = \sigma_{\text{extra}}$ (if extra driver exists)
+6. Compute payoff, intrinsic process, and split data (same as Algorithm 1, steps 4--6)
+
+**Incompleteness:** Variance $v_i$ is not directly tradeable; the market has $m > d$ risk sources.
+
+**Output:** $\tilde{S}$, $\Delta W$, time grid, $\bar{\sigma}$, $V \in \mathbb{R}^{n \times (N+1) \times d}$ (variance paths)
+
+---
+
+## Algorithm 3: Feature Construction
 
 **Input:** Discounted prices $\tilde{S}$, time grid $\{t_k\}$, maturity $T$, train/val/test indices,
-VAE latent dimension $d_z$, signature level $L = 2$.
+VAE latent dimension $d_z$, signature level $L = 2$, optional variance paths $V$ (Heston).
 
-**Part A: Base features** ($d + 1$ dimensions)
-1. $X_k^{\text{base}} = [\log \tilde{S}_k^1, \dots, \log \tilde{S}_k^d, \; T - t_k]$
+**Part A: Base features**
+- GBM: $X_k^{\text{base}} = [\log \tilde{S}_k^1, \dots, \log \tilde{S}_k^d, \; T - t_k]$ ($d + 1$ dims)
+- Heston: $X_k^{\text{base}} = [\log \tilde{S}_k^1, \dots, \log \tilde{S}_k^d, \; T - t_k, \; \log v_k^1, \dots, \log v_k^d]$ ($2d + 1$ dims)
 
 **Part B: Signature-like features** (causal, no look-ahead)
 1. Increments: $\Delta_k^a = \log \tilde{S}_k^a - \log \tilde{S}_{k-1}^a$ for $k \geq 1$, $\Delta_0 = 0$
@@ -47,6 +87,8 @@ VAE latent dimension $d_z$, signature level $L = 2$.
 
 **Combine and standardise:**
 1. Concatenate: $X_k = [X_k^{\text{base}} \,\|\, z \,\|\, C_k \,\|\, S^{(2)}_k]$, dimension $d_X$
+   - GBM: $d_X = (d+1) + d_z + d + d(d+1)/2 = 24$
+   - Heston: $d_X = (2d+1) + d_z + d + d(d+1)/2 = 26$
 2. Compute mean $\hat{\mu}$, std $\hat{\sigma}$ on **training set only**
 3. Standardise all splits: $X_k \leftarrow (X_k - \hat{\mu}) / \hat{\sigma}$
 
@@ -54,7 +96,7 @@ VAE latent dimension $d_z$, signature level $L = 2$.
 
 ---
 
-## Algorithm 3: Two-Stage Hedging (NN1 + NN2 Controller)
+## Algorithm 4: Two-Stage Hedging (NN1 + NN2 Controller)
 
 **Input:** Features $X \in \mathbb{R}^{n \times N \times d_X}$, intrinsic process $Z$,
 price increments $\Delta S_k = \tilde{S}_{k+1} - \tilde{S}_k$, controller flag.
@@ -86,13 +128,15 @@ price increments $\Delta S_k = \tilde{S}_{k+1} - \tilde{S}_k$, controller flag.
 
 ---
 
-## Algorithm 4: Deep BSDE Forward Propagation
+## Algorithm 5: Deep BSDE Forward Propagation
 
 **Input:** Features $X \in \mathbb{R}^{n \times (N+1) \times d_X}$, Brownian increments $\Delta W \in \mathbb{R}^{n \times N \times m}$,
-time grid $\{t_k\}$, diffusion matrix $\sigma$, number of sub-steps $M$.
+time grid $\{t_k\}$, diffusion matrix $\sigma$, number of sub-steps $M$, optional effective sigma $\bar{\sigma}$.
 
 1. Initialise: $Y_0 = \hat{Y}_0$ (learnable scalar parameter)
-2. Pre-compute: $(\sigma^\top)^+ = \text{pinv}(\sigma^\top) \in \mathbb{R}^{d \times m}$
+2. Pre-compute pseudo-inverse for Z-to-Delta projection:
+   - If $\bar{\sigma}$ provided (Heston): $(\bar{\sigma}^\top)^+ = \text{pinv}(\bar{\sigma}^\top) \in \mathbb{R}^{d \times m}$
+   - Else (GBM): $(\sigma^\top)^+ = \text{pinv}(\sigma^\top) \in \mathbb{R}^{d \times m}$
 
 3. **for** $k = 0, 1, \dots, N-1$ **do**
 
@@ -110,13 +154,13 @@ time grid $\{t_k\}$, diffusion matrix $\sigma$, number of sub-steps $M$.
      - $Y \leftarrow Y + Z_s \cdot \delta W_s$
 
 4. **Z-to-Delta projection** (recover tradeable hedge ratios):
-   - $\Delta_k = (\sigma^\top)^+ Z_k \;/\; \tilde{S}_k$ (element-wise division by asset prices)
+   - $\Delta_k = (\bar{\sigma}^\top)^+ Z_k \;/\; \tilde{S}_k$ (element-wise division by asset prices)
 
 **Output:** $Y_N \in \mathbb{R}^n$ (terminal BSDE value), $\{Y_k\}$, $\{Z_k\}$, $\{\Delta_k\}$
 
 ---
 
-## Algorithm 5: Hedger Training (FNN/LSTM + Controller)
+## Algorithm 6: Hedger Training (FNN/LSTM + Controller)
 
 **Input:** Training data $(X^{\text{tr}}, Z^{\text{tr}}, \Delta S^{\text{tr}}, \tilde{H}^{\text{tr}})$,
 validation data $(X^{\text{val}}, \dots)$, hyperparameters $(\eta, B, \alpha, \beta, q, \lambda_1, \lambda_2, P)$.
@@ -129,7 +173,7 @@ validation data $(X^{\text{val}}, \dots)$, hyperparameters $(\eta, B, \alpha, \b
 5. **for** epoch $= 1, 2, \dots, E_{\max}$ **do**
    - Randomly permute training indices
    - **for** each mini-batch $\mathcal{B}$ of size $B$ **do**
-     - Forward pass: $V_T = \text{Algorithm 3}(X_\mathcal{B}, Z_\mathcal{B}, \Delta S_\mathcal{B})$
+     - Forward pass: $V_T = \text{Algorithm 4}(X_\mathcal{B}, Z_\mathcal{B}, \Delta S_\mathcal{B})$
      - Terminal error: $e_T = V_T - \tilde{H}_\mathcal{B}$
      - Shortfall: $s = \max(\tilde{H}_\mathcal{B} - V_T, 0)$
      - Data loss: $\mathcal{L}_{\text{data}} = \text{MSE}(e_T) + \alpha \cdot \bar{s} + \beta \cdot \text{CVaR}_q(s)$
@@ -147,7 +191,7 @@ validation data $(X^{\text{val}}, \dots)$, hyperparameters $(\eta, B, \alpha, \b
 
 ---
 
-## Algorithm 6: Deep BSDE Training
+## Algorithm 7: Deep BSDE Training
 
 **Input:** Training data $(X^{\text{tr}}, \Delta W^{\text{tr}}, \tilde{H}^{\text{tr}}, \{t_k\})$,
 validation data, hyperparameters $(\eta, B, \lambda_1, \lambda_2, q, M, P)$.
@@ -157,12 +201,12 @@ validation data, hyperparameters $(\eta, B, \lambda_1, \lambda_2, q, M, P)$.
 
 3. **for** epoch $= 1, 2, \dots, E_{\max}$ **do**
    - **for** each mini-batch $\mathcal{B}$ of size $B$ **do**
-     - Forward: $Y_N = \text{Algorithm 4}(X_\mathcal{B}, \Delta W_\mathcal{B}, \{t_k\}, M)$
+     - Forward: $Y_N = \text{Algorithm 5}(X_\mathcal{B}, \Delta W_\mathcal{B}, \{t_k\}, M)$
      - Loss: $\mathcal{L} = \text{MSE}(Y_N - \tilde{H}_\mathcal{B}) + \lambda_1 \sum_W |W| + \lambda_2 \sum_W W^2$
      - $\theta \leftarrow \theta - \eta \cdot \text{Adam}(\nabla_\theta \mathcal{L})$ with $\|\nabla\|$ clipped to 10
 
    - **Validation:** $\text{CVaR}_q^{\text{val}} = \text{CVaR}_q\bigl(\max(\tilde{H}^{\text{val}} - Y_N^{\text{val}}, 0)\bigr)$
-   - **Early stopping** with patience $P$ (same as Algorithm 5)
+   - **Early stopping** with patience $P$ (same as Algorithm 6)
 
 4. Restore best weights
 
@@ -170,10 +214,14 @@ validation data, hyperparameters $(\eta, B, \lambda_1, \lambda_2, q, M, P)$.
 
 ---
 
-## Algorithm 7: Two-Stage Bias Control Protocol
+## Algorithm 8: Two-Stage Bias Control Protocol
 
 **Input:** Model classes $\mathcal{M} = \{\text{FNN}, \text{LSTM}, \text{DBSDE}\}$,
-hyperparameter grid $\mathcal{G}$, architecture seed $s_0$, robustness seeds $\{s_1, \dots, s_R\}$.
+hyperparameter grid $\mathcal{G}$, architecture seed $s_0$, robustness seeds $\{s_1, \dots, s_R\}$,
+market models $\mathcal{K} = \{\text{GBM}, \text{Heston}\}$.
+
+The full protocol runs independently for each market model $\mathcal{K}_j$ using
+the same data split (shared indices across market models).
 
 **Stage 1: Optuna HP Search (TPE Bayesian optimisation)**
 
@@ -181,7 +229,7 @@ hyperparameter grid $\mathcal{G}$, architecture seed $s_0$, robustness seeds $\{
    - Set seed $s_0$
    - **for** trial $= 1, \dots, T_{\max}$ (TPE-sampled) **do**
      - Sample: depth $\in \{3, 5, 7\}$, width $\in \{64, 128, 256\}$, activation $\in \{\text{relu}, \text{tanh}, \text{alt}_1, \text{alt}_2\}$, lr $\in \{3\!\times\!10^{-4}, 10^{-3}, 3\!\times\!10^{-3}\}$
-     - Train model $m$ with sampled config (Algorithm 5 or 6)
+     - Train model $m$ with sampled config (Algorithm 6 or 7)
      - Record $\text{CVaR}_{0.95}^{\text{val}}$ and $\text{MSE}^{\text{val}}$
    - Select best: $\arg\min$ CVaR$_{0.95}^{\text{val}}$, tie-break by MSE, then prefer smaller lr
    - Store $c_m^* = (\text{depth}^*, \text{width}^*, \text{act}^*, \text{lr}^*)$
@@ -190,7 +238,7 @@ hyperparameter grid $\mathcal{G}$, architecture seed $s_0$, robustness seeds $\{
 
 2. **for** each model class $m \in \mathcal{M}$ **do**
    - **for** each seed $s \in \{s_1, \dots, s_R\}$ **do**
-     - Train $m$ with config $c_m^*$ and seed $s$ (Algorithm 5 or 6)
+     - Train $m$ with config $c_m^*$ and seed $s$ (Algorithm 6 or 7)
      - Evaluate on validation set: $\text{metrics}_s$
      - Generate per-model diagnostic plots (8 per seed)
    - Aggregate: $\bar{\mu} \pm \sigma$ across seeds for each metric
@@ -200,11 +248,17 @@ hyperparameter grid $\mathcal{G}$, architecture seed $s_0$, robustness seeds $\{
 3. Best model: $m^* = \arg\min_{m \in \mathcal{M}} \bar{\text{CVaR}}_{0.95}^{\text{val}}(m)$
 4. Generate comparison plots: grouped bars, error overlays, CVaR curves, highlighted summary
 
-**Output:** Best configs $\{c_m^*\}$, aggregated validation metrics, best model $m^*$, all diagnostic plots
+**Cross-model comparison** (when both market models run):
+
+5. Compare P\&L distributions per model across GBM vs Heston (histogram + violin)
+6. Compare all models under each regime (all-model overlay per market model)
+7. Grouped metric bar charts: GBM vs Heston for each metric
+
+**Output:** Best configs $\{c_m^*\}$, aggregated validation metrics per market model, best model $m^*$, all diagnostic and comparison plots
 
 ---
 
-## Algorithm 8: FNN Hedger (Method I: Feedforward Neural Network)
+## Algorithm 9: FNN Hedger (Method I: Feedforward Neural Network)
 
 **Input:** Features $X_k \in \mathbb{R}^{d_X}$ at time step $k$, network depth $D$, width $W$,
 activation schedule $\phi$, dropout rate $p$.
@@ -228,7 +282,7 @@ Activation $\phi_\ell$ depends on the schedule: all-ReLU, all-Tanh, or alternati
 
 ---
 
-## Algorithm 9: LSTM Hedger (Method II: Long Short-Term Memory Network)
+## Algorithm 10: LSTM Hedger (Method II: Long Short-Term Memory Network)
 
 **Input:** Feature sequence $X = \{X_k\}_{k=0}^{N-1} \in \mathbb{R}^{n \times N \times d_X}$,
 LSTM layers $L$, hidden size $H$, activation schedule $\phi$, dropout rate $p$.
@@ -254,11 +308,11 @@ LSTM layers $L$, hidden size $H$, activation schedule $\phi$, dropout rate $p$.
 
 ---
 
-## Algorithm 10: Deep BSDE Solver (Method III)
+## Algorithm 11: Deep BSDE Solver (Method III)
 
 **Input:** Features $X \in \mathbb{R}^{n \times (N+1) \times d_X}$, Brownian increments $\Delta W \in \mathbb{R}^{n \times N \times m}$,
 time grid $\{t_k\}_{k=0}^N$, diffusion matrix $\sigma \in \mathbb{R}^{d \times m}$,
-network depth $D$, width $W$, sub-steps $M$.
+network depth $D$, width $W$, sub-steps $M$, optional effective sigma $\bar{\sigma} \in \mathbb{R}^{d \times m}$.
 
 **Architecture:**
 
@@ -282,13 +336,14 @@ network depth $D$, width $W$, sub-steps $M$.
 
 **Z-to-Delta projection** (recover tradeable hedge from BSDE control):
 - Relationship: $Z_k = \sigma^\top \, \text{diag}(\tilde{S}_k) \, \Delta_k$
-- Solution: $\Delta_k = (\sigma^\top)^+ Z_k \;/\; \tilde{S}_k$ where $(\sigma^\top)^+$ is the Moore-Penrose pseudo-inverse
+- GBM: $\Delta_k = (\sigma^\top)^+ Z_k \;/\; \tilde{S}_k$
+- Heston: $\Delta_k = (\bar{\sigma}^\top)^+ Z_k \;/\; \tilde{S}_k$ where $\bar{\sigma}_{i,2i} = \sqrt{\theta_i}$ (long-run vol)
 
 **Output:** $Y_N$ (terminal value), $\hat{Y}_0$ (learned option price), $\{Z_k\}$, $\{\Delta_k\}$ (hedge ratios)
 
 ---
 
-## Algorithm 11: Loss Functions
+## Algorithm 12: Loss Functions
 
 **Terminal error:** $e_T = V_T - \tilde{H}$ (positive = over-hedge, negative = under-hedge)
 
