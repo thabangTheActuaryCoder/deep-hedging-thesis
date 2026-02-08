@@ -407,3 +407,335 @@ def plot_model_comparison_gbm_vs_heston(gbm_agg, heston_agg, output_dir):
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "gbm_vs_heston_bars.png"), dpi=150)
     plt.close(fig)
+
+
+def plot_pnl_gbm_vs_heston(gbm_comp, heston_comp, output_dir):
+    """Overlay P&L histograms comparing GBM (const sigma) vs Heston (stoch sigma).
+
+    For each model (FNN, LSTM, DBSDE), plots the terminal hedging P&L
+    distribution under both market dynamics side by side, similar to
+    "NN Sigma vs Const Sigma" comparisons in the literature.
+
+    Args:
+        gbm_comp: {model_name: {"V_T": tensor, "H_tilde": tensor}} from GBM pipeline
+        heston_comp: {model_name: {"V_T": tensor, "H_tilde": tensor}} from Heston pipeline
+        output_dir: output directory
+    """
+    ensure_dir(output_dir)
+    models = sorted(set(gbm_comp.keys()) & set(heston_comp.keys()))
+    if not models:
+        return
+
+    n_models = len(models)
+    fig, axes = plt.subplots(n_models, 1, figsize=(10, 5 * n_models))
+    if n_models == 1:
+        axes = [axes]
+
+    for i, model in enumerate(models):
+        ax = axes[i]
+
+        # GBM P&L
+        g_vt = gbm_comp[model]["V_T"]
+        g_h = gbm_comp[model]["H_tilde"]
+        if torch.is_tensor(g_vt):
+            g_pnl = (g_vt - g_h).cpu().numpy()
+        else:
+            g_pnl = np.array(g_vt) - np.array(g_h)
+
+        # Heston P&L
+        h_vt = heston_comp[model]["V_T"]
+        h_h = heston_comp[model]["H_tilde"]
+        if torch.is_tensor(h_vt):
+            h_pnl = (h_vt - h_h).cpu().numpy()
+        else:
+            h_pnl = np.array(h_vt) - np.array(h_h)
+
+        # Shared bin range
+        lo = min(g_pnl.min(), h_pnl.min())
+        hi = max(g_pnl.max(), h_pnl.max())
+        bins = np.linspace(lo, hi, 70)
+
+        ax.hist(h_pnl, bins=bins, alpha=0.7, color="#7B2D8E",
+                edgecolor="black", linewidth=0.3,
+                label="Heston (Stoch. $\\sigma$)")
+        ax.hist(g_pnl, bins=bins, alpha=0.5, color="#2EC4B6",
+                edgecolor="black", linewidth=0.3,
+                label="GBM (Const. $\\sigma$)")
+
+        ax.set_xlabel("Profit/Loss")
+        ax.set_ylabel("Frequency")
+        ax.set_title(f"{model}: P&L with Different Volatility Models")
+        ax.legend()
+        ax.grid(True, alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "pnl_gbm_vs_heston.png"), dpi=150)
+    plt.close(fig)
+
+
+def plot_pnl_violin_gbm_vs_heston(gbm_comp, heston_comp, output_dir):
+    """Violin plots comparing P&L distributions: Heston (stoch sigma) vs GBM (const sigma).
+
+    For each model, shows two side-by-side violins with median lines and
+    whiskers — pink for Heston, cyan for GBM.
+
+    Args:
+        gbm_comp: {model_name: {"V_T": tensor, "H_tilde": tensor}} from GBM pipeline
+        heston_comp: {model_name: {"V_T": tensor, "H_tilde": tensor}} from Heston pipeline
+        output_dir: output directory
+    """
+    ensure_dir(output_dir)
+    models = sorted(set(gbm_comp.keys()) & set(heston_comp.keys()))
+    if not models:
+        return
+
+    n_models = len(models)
+    fig, axes = plt.subplots(n_models, 1, figsize=(8, 6 * n_models))
+    if n_models == 1:
+        axes = [axes]
+
+    for i, model in enumerate(models):
+        ax = axes[i]
+
+        # Compute P&L
+        g_vt = gbm_comp[model]["V_T"]
+        g_h = gbm_comp[model]["H_tilde"]
+        if torch.is_tensor(g_vt):
+            g_pnl = (g_vt - g_h).cpu().numpy()
+        else:
+            g_pnl = np.array(g_vt) - np.array(g_h)
+
+        h_vt = heston_comp[model]["V_T"]
+        h_h = heston_comp[model]["H_tilde"]
+        if torch.is_tensor(h_vt):
+            h_pnl = (h_vt - h_h).cpu().numpy()
+        else:
+            h_pnl = np.array(h_vt) - np.array(h_h)
+
+        parts = ax.violinplot([h_pnl, g_pnl], positions=[1, 2],
+                              showmeans=False, showmedians=True,
+                              showextrema=True)
+
+        # Color violins: pink for Heston, cyan for GBM
+        colors = ["#E88AED", "#A8E6E2"]
+        for pc, color in zip(parts["bodies"], colors):
+            pc.set_facecolor(color)
+            pc.set_edgecolor(color)
+            pc.set_alpha(0.75)
+
+        # Style median/extrema lines
+        for key in ("cmedians", "cmins", "cmaxes", "cbars"):
+            if key in parts:
+                parts[key].set_color("#333333")
+                parts[key].set_linewidth(1.5)
+
+        ax.set_xticks([1, 2])
+        ax.set_xticklabels([
+            f"Heston (Stoch. $\\sigma$)",
+            f"GBM (Const. $\\sigma$)",
+        ])
+        ax.set_ylabel("Profit/Loss")
+        ax.set_title(f"{model}: P&L with Different Volatility Models")
+        ax.grid(True, alpha=0.2, axis="y")
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "pnl_violin_gbm_vs_heston.png"), dpi=150)
+    plt.close(fig)
+
+
+def plot_pnl_per_model_hist(gbm_comp, heston_comp, output_dir):
+    """Per-model histogram: GBM (const sigma) vs Heston (stoch vol) P&L.
+
+    Creates one figure per model, each with two overlaid histograms.
+    """
+    models = sorted(set(gbm_comp.keys()) & set(heston_comp.keys()))
+    if not models:
+        return
+
+    for model in models:
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        g_vt = gbm_comp[model]["V_T"]
+        g_h = gbm_comp[model]["H_tilde"]
+        g_pnl = (g_vt - g_h).cpu().numpy() if torch.is_tensor(g_vt) else np.array(g_vt) - np.array(g_h)
+
+        h_vt = heston_comp[model]["V_T"]
+        h_h = heston_comp[model]["H_tilde"]
+        h_pnl = (h_vt - h_h).cpu().numpy() if torch.is_tensor(h_vt) else np.array(h_vt) - np.array(h_h)
+
+        bins = np.linspace(
+            min(g_pnl.min(), h_pnl.min()),
+            max(g_pnl.max(), h_pnl.max()),
+            80,
+        )
+        ax.hist(g_pnl, bins=bins, alpha=0.55, color="#00CED1", label="GBM (Const. $\\sigma$)",
+                edgecolor="white", linewidth=0.3)
+        ax.hist(h_pnl, bins=bins, alpha=0.55, color="#9B59B6", label="Heston (Stoch. $\\sigma$)",
+                edgecolor="white", linewidth=0.3)
+
+        ax.axvline(0, color="black", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax.set_xlabel("Profit / Loss")
+        ax.set_ylabel("Frequency")
+        ax.set_title(f"{model}: P&L — Constant vs Stochastic Volatility")
+        ax.legend(framealpha=0.9)
+        ax.grid(True, alpha=0.2)
+
+        fig.tight_layout()
+        safe = model.replace(" ", "_").replace("-", "_").lower()
+        fig.savefig(os.path.join(output_dir, f"pnl_hist_{safe}_gbm_vs_heston.png"), dpi=150)
+        plt.close(fig)
+
+
+def plot_pnl_per_model_violin(gbm_comp, heston_comp, output_dir):
+    """Per-model violin: GBM (const sigma) vs Heston (stoch vol) P&L.
+
+    Creates one figure per model, each with two violin bodies.
+    """
+    models = sorted(set(gbm_comp.keys()) & set(heston_comp.keys()))
+    if not models:
+        return
+
+    for model in models:
+        fig, ax = plt.subplots(figsize=(6, 5))
+
+        g_vt = gbm_comp[model]["V_T"]
+        g_h = gbm_comp[model]["H_tilde"]
+        g_pnl = (g_vt - g_h).cpu().numpy() if torch.is_tensor(g_vt) else np.array(g_vt) - np.array(g_h)
+
+        h_vt = heston_comp[model]["V_T"]
+        h_h = heston_comp[model]["H_tilde"]
+        h_pnl = (h_vt - h_h).cpu().numpy() if torch.is_tensor(h_vt) else np.array(h_vt) - np.array(h_h)
+
+        parts = ax.violinplot([g_pnl, h_pnl], positions=[1, 2],
+                              showmeans=True, showmedians=True, showextrema=True)
+
+        colors = ["#00CED1", "#9B59B6"]
+        for pc, color in zip(parts["bodies"], colors):
+            pc.set_facecolor(color)
+            pc.set_edgecolor(color)
+            pc.set_alpha(0.7)
+        for key in ("cmeans", "cmedians", "cmins", "cmaxes", "cbars"):
+            if key in parts:
+                parts[key].set_color("#333333")
+                parts[key].set_linewidth(1.2)
+
+        ax.axhline(0, color="black", linestyle="--", linewidth=0.8, alpha=0.4)
+        ax.set_xticks([1, 2])
+        ax.set_xticklabels(["GBM (Const. $\\sigma$)", "Heston (Stoch. $\\sigma$)"])
+        ax.set_ylabel("Profit / Loss")
+        ax.set_title(f"{model}: P&L — Constant vs Stochastic Volatility")
+        ax.grid(True, alpha=0.2, axis="y")
+
+        fig.tight_layout()
+        safe = model.replace(" ", "_").replace("-", "_").lower()
+        fig.savefig(os.path.join(output_dir, f"pnl_violin_{safe}_gbm_vs_heston.png"), dpi=150)
+        plt.close(fig)
+
+
+def plot_pnl_all_models_by_regime_hist(gbm_comp, heston_comp, output_dir):
+    """Cross-model histogram: all models overlaid under same regime.
+
+    Two figures: (1) all models under GBM, (2) all models under Heston.
+    """
+    model_colors = {
+        "FNN-5": "#2196F3",
+        "LSTM-5": "#FF9800",
+        "DBSDE": "#4CAF50",
+    }
+
+    for regime, comp, label in [
+        ("gbm", gbm_comp, "GBM (Const. $\\sigma$)"),
+        ("heston", heston_comp, "Heston (Stoch. $\\sigma$)"),
+    ]:
+        if not comp:
+            continue
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+        all_pnl = {}
+        for model in sorted(comp.keys()):
+            vt = comp[model]["V_T"]
+            ht = comp[model]["H_tilde"]
+            pnl = (vt - ht).cpu().numpy() if torch.is_tensor(vt) else np.array(vt) - np.array(ht)
+            all_pnl[model] = pnl
+
+        if not all_pnl:
+            plt.close(fig)
+            continue
+
+        lo = min(p.min() for p in all_pnl.values())
+        hi = max(p.max() for p in all_pnl.values())
+        bins = np.linspace(lo, hi, 80)
+
+        for model, pnl in all_pnl.items():
+            color = model_colors.get(model, "#888888")
+            ax.hist(pnl, bins=bins, alpha=0.45, color=color, label=model,
+                    edgecolor="white", linewidth=0.3)
+
+        ax.axvline(0, color="black", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax.set_xlabel("Profit / Loss")
+        ax.set_ylabel("Frequency")
+        ax.set_title(f"All Models P&L — {label}")
+        ax.legend(framealpha=0.9)
+        ax.grid(True, alpha=0.2)
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, f"pnl_hist_all_models_{regime}.png"), dpi=150)
+        plt.close(fig)
+
+
+def plot_pnl_all_models_by_regime_violin(gbm_comp, heston_comp, output_dir):
+    """Cross-model violin: all models compared under same regime.
+
+    Two figures: (1) all models under GBM, (2) all models under Heston.
+    """
+    model_colors = {
+        "FNN-5": "#2196F3",
+        "LSTM-5": "#FF9800",
+        "DBSDE": "#4CAF50",
+    }
+
+    for regime, comp, label in [
+        ("gbm", gbm_comp, "GBM (Const. $\\sigma$)"),
+        ("heston", heston_comp, "Heston (Stoch. $\\sigma$)"),
+    ]:
+        if not comp:
+            continue
+
+        models = sorted(comp.keys())
+        if not models:
+            continue
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        pnl_data = []
+        labels = []
+        for model in models:
+            vt = comp[model]["V_T"]
+            ht = comp[model]["H_tilde"]
+            pnl = (vt - ht).cpu().numpy() if torch.is_tensor(vt) else np.array(vt) - np.array(ht)
+            pnl_data.append(pnl)
+            labels.append(model)
+
+        positions = list(range(1, len(models) + 1))
+        parts = ax.violinplot(pnl_data, positions=positions,
+                              showmeans=True, showmedians=True, showextrema=True)
+
+        for pc, model in zip(parts["bodies"], models):
+            color = model_colors.get(model, "#888888")
+            pc.set_facecolor(color)
+            pc.set_edgecolor(color)
+            pc.set_alpha(0.7)
+        for key in ("cmeans", "cmedians", "cmins", "cmaxes", "cbars"):
+            if key in parts:
+                parts[key].set_color("#333333")
+                parts[key].set_linewidth(1.2)
+
+        ax.axhline(0, color="black", linestyle="--", linewidth=0.8, alpha=0.4)
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels)
+        ax.set_ylabel("Profit / Loss")
+        ax.set_title(f"All Models P&L — {label}")
+        ax.grid(True, alpha=0.2, axis="y")
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, f"pnl_violin_all_models_{regime}.png"), dpi=150)
+        plt.close(fig)

@@ -43,6 +43,7 @@ from src.eval.plots import (
     generate_all_plots, plot_substeps_convergence, plot_summary_table,
     plot_model_comparison_bars, plot_model_comparison_errors,
     plot_model_comparison_cvar, plot_validation_summary,
+    plot_optuna_validation_loss,
 )
 from src.eval.plots_3d import generate_3d_plots, generate_bsde_3d_plots
 from src.eval.plots_heston import (
@@ -51,6 +52,12 @@ from src.eval.plots_heston import (
     plot_vol_of_vol, plot_heston_summary,
     plot_price_vs_gbm,
     plot_model_comparison_gbm_vs_heston,
+    plot_pnl_gbm_vs_heston,
+    plot_pnl_violin_gbm_vs_heston,
+    plot_pnl_per_model_hist,
+    plot_pnl_per_model_violin,
+    plot_pnl_all_models_by_regime_hist,
+    plot_pnl_all_models_by_regime_violin,
 )
 
 
@@ -730,6 +737,15 @@ def run_pipeline(market_label, args, device, S_tilde, dW, time_grid, sigma,
                       stage1_path)
             print(f"  [saved Stage 1 progress: {list(best_configs.keys())}]")
 
+    # Generate Optuna validation loss plots per model
+    plots_val_dir = os.path.join(output_dir, "plots_val")
+    for model_class in all_models:
+        tlog = trial_logs.get(model_class, [])
+        if tlog:
+            plot_optuna_validation_loss(tlog, model_class, output_dir=plots_val_dir)
+    if trial_logs:
+        print("  Generated Optuna validation loss plots")
+
     # ── Step 4: Stage 2 – Seed robustness (val only) ──
     print(f"\n=== [{market_label}] Step 4: Stage 2 – Seed Robustness (Validation) ===")
 
@@ -922,7 +938,7 @@ def run_pipeline(market_label, args, device, S_tilde, dW, time_grid, sigma,
     _write_csv_summary(all_agg, os.path.join(output_dir, "val_metrics_summary.csv"))
 
     print(f"\n  [{market_label}] Done. Results saved to {output_dir}/")
-    return all_agg
+    return all_agg, all_comparison
 
 
 def main():
@@ -956,7 +972,9 @@ def main():
     print(f"Train={len(train_idx)}  Val={len(val_idx)}  Test={len(test_idx)}")
 
     gbm_agg = None
+    gbm_comp = {}
     heston_agg = None
+    heston_comp = {}
 
     # ── GBM pipeline ──
     if args.market_model in ("gbm", "both"):
@@ -977,7 +995,7 @@ def main():
 
         print(f"  GBM: r={args.r}, vols={vols}, extra_vol={extra_vol}")
 
-        gbm_agg = run_pipeline(
+        gbm_agg, gbm_comp = run_pipeline(
             "gbm", args, device, S_tilde, dW, time_grid, sigma,
             H_tilde, Z_intrinsic, train_idx, val_idx, test_idx, split_hash,
         )
@@ -1008,7 +1026,7 @@ def main():
               f"theta={heston_params['theta']}, xi={heston_params['xi']}, "
               f"rho={heston_params['rho']}")
 
-        heston_agg = run_pipeline(
+        heston_agg, heston_comp = run_pipeline(
             "heston", args, device, S_tilde_h, dW_h, time_grid_h, sigma_avg_h,
             H_tilde_h, Z_intrinsic_h, train_idx, val_idx, test_idx, split_hash,
             V_paths=V_paths_h, heston_params=heston_params,
@@ -1025,8 +1043,40 @@ def main():
         plot_model_comparison_gbm_vs_heston(gbm_agg, heston_agg, comparison_dir)
 
         # Price path comparison (Heston vs GBM)
-        # S_tilde (GBM) and S_tilde_h (Heston) are still in scope from above
         plot_price_vs_gbm(S_tilde_h, S_tilde, time_grid, comparison_dir)
+
+        # P&L comparison: GBM vs Heston per model
+        if gbm_comp and heston_comp:
+            plot_pnl_gbm_vs_heston(gbm_comp, heston_comp, comparison_dir)
+            plot_pnl_violin_gbm_vs_heston(gbm_comp, heston_comp, comparison_dir)
+
+            # Per-model individual figures (histogram + violin)
+            plot_pnl_per_model_hist(gbm_comp, heston_comp, comparison_dir)
+            plot_pnl_per_model_violin(gbm_comp, heston_comp, comparison_dir)
+
+            # Cross-model same-regime figures (histogram + violin)
+            plot_pnl_all_models_by_regime_hist(gbm_comp, heston_comp, comparison_dir)
+            plot_pnl_all_models_by_regime_violin(gbm_comp, heston_comp, comparison_dir)
+
+        # Save comparison data for standalone replotting
+        comp_data = {}
+        if gbm_comp and heston_comp:
+            comp_data["gbm_comp"] = {
+                m: {k: v.cpu() if torch.is_tensor(v) else torch.tensor(v)
+                    for k, v in d.items()}
+                for m, d in gbm_comp.items()
+            }
+            comp_data["heston_comp"] = {
+                m: {k: v.cpu() if torch.is_tensor(v) else torch.tensor(v)
+                    for k, v in d.items()}
+                for m, d in heston_comp.items()
+            }
+        # Subsample price paths (only need ~50 for visual)
+        n_save = min(50, S_tilde.shape[0])
+        comp_data["S_tilde_gbm_sample"] = S_tilde[:n_save].cpu()
+        comp_data["S_tilde_heston_sample"] = S_tilde_h[:n_save].cpu()
+        comp_data["time_grid"] = time_grid.cpu()
+        torch.save(comp_data, os.path.join(comparison_dir, "comparison_data.pt"))
 
         # Save combined summary
         combined = {
@@ -1035,6 +1085,7 @@ def main():
         }
         save_json(combined, os.path.join(args.output_dir, "metrics_summary.json"))
         print(f"  Saved GBM vs Heston comparison to {comparison_dir}/")
+        print(f"  Saved replot data to {comparison_dir}/comparison_data.pt")
 
     print("\n=== All Done ===")
     print(f"Results saved to {args.output_dir}/")

@@ -25,6 +25,7 @@
 !tests/
 !data/
 !run_experiment.py
+!replot.py
 
 # Python artifacts (always ignore)
 __pycache__/

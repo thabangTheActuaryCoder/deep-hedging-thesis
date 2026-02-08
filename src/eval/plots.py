@@ -393,3 +393,55 @@ def plot_validation_summary(all_agg, best_model, output_dir="outputs/plots_val")
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "validation_summary.png"), dpi=150)
     plt.close(fig)
+
+
+def plot_optuna_validation_loss(trial_log, model_name, output_dir="outputs/plots_val"):
+    """Scatter plot of validation loss across Optuna hyperparameter configurations.
+
+    Shows each tried configuration as a dot, with dashed crosshairs
+    highlighting the best (lowest CVaR95) configuration.
+
+    Args:
+        trial_log: list of dicts with keys lr, act_schedule, depth, width, val_CVaR95
+        model_name: str, e.g. "FNN", "LSTM", "DBSDE"
+        output_dir: output directory
+    """
+    ensure_dir(output_dir)
+    if not trial_log:
+        return
+
+    # Sort by val_CVaR95 for consistent ordering
+    sorted_log = sorted(trial_log, key=lambda x: x["val_CVaR95"])
+
+    # Build x-axis labels: [lr, act_schedule, depth, width]
+    labels = []
+    vals = []
+    for t in sorted_log:
+        label = f"[{t['lr']}, {t['act_schedule']}, {t['depth']}, {t['width']}]"
+        labels.append(label)
+        vals.append(t["val_CVaR95"])
+
+    vals = np.array(vals)
+    x = np.arange(len(vals))
+
+    # Best configuration
+    best_idx = np.argmin(vals)
+    best_val = vals[best_idx]
+
+    fig, ax = plt.subplots(figsize=(max(8, len(vals) * 0.8), 6))
+    ax.scatter(x, vals, s=40, color="blue", zorder=5)
+
+    # Dashed crosshairs at best
+    ax.axhline(best_val, color="black", linestyle="--", linewidth=1, alpha=0.7)
+    ax.axvline(best_idx, color="black", linestyle="--", linewidth=1, alpha=0.7)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=70, ha="right", fontsize=7)
+    ax.set_xlabel("Best Parameters")
+    ax.set_ylabel("Error")
+    ax.set_title(f"{model_name}: Validation Loss")
+    ax.grid(True, alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, f"{model_name}_optuna_validation_loss.png"),
+                dpi=150)
+    plt.close(fig)
