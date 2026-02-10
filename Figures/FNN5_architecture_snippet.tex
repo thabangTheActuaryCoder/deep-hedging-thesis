@@ -1,0 +1,14 @@
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/FNN5_architecture.pdf}
+    \caption{Architecture of the FNN-5 hedger ($\mathrm{NN}_1$).
+    The network receives 24-dimensional feature vectors
+    $\mathbf{X}_k = [\log \tilde{S}_k^{(1)}, \log \tilde{S}_k^{(2)}, \tau_k,
+    \mathbf{z}_{1:16}^{\mathrm{VAE}}, \mathrm{Sig}_k^{(1)}, \mathrm{Sig}_k^{(2)}]$
+    at each time step~$k$ and outputs hedge ratios
+    $\Delta_k^{(1)} \in \mathbb{R}^{d_{\mathrm{traded}}}$.
+    Each of the five hidden blocks consists of a fully connected layer (128~units),
+    layer normalisation, activation (alternating ReLU/Tanh), and dropout ($p=0.1$).
+    Parameters are shared across all $N$~time steps.}
+    \label{fig:fnn5_architecture}
+\end{figure}

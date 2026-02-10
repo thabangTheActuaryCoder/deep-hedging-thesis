@@ -1,0 +1,12 @@
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/LSTM5_architecture.pdf}
+    \caption{Architecture of the LSTM-5 hedger ($\mathrm{NN}_1$).
+    The full feature sequence $\mathbf{X}_{0:N}$ is first projected by
+    a pre-MLP, then processed by a 5-layer stacked LSTM with 128~hidden units
+    and dropout between layers. A head MLP maps the LSTM output at each step
+    to hedge ratios $\Delta_k^{(1)} \in \mathbb{R}^{d_{\mathrm{traded}}}$.
+    Recurrent hidden and cell states $(h_t, c_t)$ carry temporal information
+    across time steps.}
+    \label{fig:lstm5_architecture}
+\end{figure}

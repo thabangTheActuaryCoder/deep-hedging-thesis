@@ -1,0 +1,13 @@
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/DeepBSDE_architecture.pdf}
+    \caption{Architecture of the Deep BSDE solver.
+    A learnable initial value $Y_0$ is propagated via
+    $Y_{k+1} = Y_k + Z_k^\top dW_k$, where the control $Z_k$ is produced
+    by a 4-block Z-network that takes features $\mathbf{X}_k$ concatenated
+    with a sinusoidal time embedding $\phi(t_k) \in \mathbb{R}^{32}$.
+    Hedge ratios are recovered via pseudo-inverse projection:
+    $\Delta_k = (\sigma^\top)^+ Z_k / \tilde{S}_k$.
+    The terminal loss $\mathcal{L} = \mathrm{MSE}(Y_N - \tilde{H})$ drives learning.}
+    \label{fig:bsde_architecture}
+\end{figure}

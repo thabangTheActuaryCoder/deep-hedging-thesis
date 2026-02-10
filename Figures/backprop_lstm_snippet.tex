@@ -1,0 +1,22 @@
+%% ──────────────────────────────────────────────────────────
+%% Animated Backpropagation Figure (LSTM)
+%% Requires: \usepackage{animate} in preamble
+%% Requires: Adobe Acrobat Reader for playback
+%% ──────────────────────────────────────────────────────────
+\begin{figure}[htbp]
+    \centering
+    \animategraphics[
+        autoplay,
+        loop,
+        controls,
+        width=0.95\textwidth
+    ]{10}{Figures/backprop_frames/lstm_}{0000}{0149}
+    \caption{Animated backpropagation through the LSTM architecture.
+    \textbf{Phase~1} (blue): forward pass propagates activations left to right.
+    \textbf{Phase~2} (gold): loss computation
+    $\mathcal{L} = \mathrm{MSE} + \alpha\,\bar{s} + \beta\,\mathrm{CVaR}_{0.95}(s) + \lambda\|\theta\|$.
+    \textbf{Phase~3} (red): backward pass propagates gradients $\partial\mathcal{L}/\partial\theta$ right to left.
+    \textbf{Phase~4} (green): Adam weight update with gradient clipping $(\|\nabla\| \leq 10)$.
+    View in Adobe Acrobat Reader for animation playback.}
+    \label{fig:backprop_lstm}
+\end{figure}
