@@ -866,6 +866,62 @@ def run_pipeline(market_label, args, device, S_tilde, dW, time_grid, sigma,
             clear_gpu_cache()
             print(f"  [GPU memory cleared after {model_class}]")
 
+    # ── Consolidated trials database (all models in one table) ──
+    import sqlite3
+    consolidated_db = os.path.join(output_dir, "run_configs", "all_trials.db")
+    with sqlite3.connect(consolidated_db) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trials (
+                model       TEXT,
+                trial_num   INTEGER,
+                depth       INTEGER,
+                width       INTEGER,
+                act_schedule TEXT,
+                lr          REAL,
+                val_CVaR95  REAL,
+                val_MSE     REAL,
+                is_best     INTEGER DEFAULT 0,
+                PRIMARY KEY (model, trial_num)
+            )
+        """)
+        for mc in all_models:
+            tlog = trial_logs.get(mc, [])
+            bc = best_configs.get(mc, {})
+            best_key = (bc.get("depth"), bc.get("width"),
+                        bc.get("act_schedule"), bc.get("lr"))
+            for i, t in enumerate(tlog):
+                t_key = (t["depth"], t["width"], t["act_schedule"], t["lr"])
+                conn.execute("""
+                    INSERT OR REPLACE INTO trials
+                    (model, trial_num, depth, width, act_schedule, lr,
+                     val_CVaR95, val_MSE, is_best)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (mc, i, t["depth"], t["width"], t["act_schedule"],
+                      t["lr"], t["val_CVaR95"], t["val_MSE"],
+                      1 if t_key == best_key else 0))
+        conn.commit()
+    print(f"  Consolidated trials saved to {consolidated_db}")
+
+    # Also write a CSV for easy viewing
+    import csv
+    csv_path = os.path.join(output_dir, "run_configs", "all_trials.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["model", "trial", "depth", "width", "act_schedule",
+                     "lr", "val_CVaR95", "val_MSE", "is_best"])
+        for mc in all_models:
+            tlog = trial_logs.get(mc, [])
+            bc = best_configs.get(mc, {})
+            best_key = (bc.get("depth"), bc.get("width"),
+                        bc.get("act_schedule"), bc.get("lr"))
+            for i, t in enumerate(tlog):
+                t_key = (t["depth"], t["width"], t["act_schedule"], t["lr"])
+                w.writerow([mc, i, t["depth"], t["width"], t["act_schedule"],
+                            t["lr"], f"{t['val_CVaR95']:.6f}",
+                            f"{t['val_MSE']:.6f}",
+                            1 if t_key == best_key else 0])
+    print(f"  Consolidated CSV saved to {csv_path}")
+
     # Generate Optuna validation loss plots per model
     plots_val_dir = os.path.join(output_dir, "plots_val")
     for model_class in all_models:
