@@ -14,6 +14,9 @@ import time
 import copy
 import logging
 
+# Reduce CUDA memory fragmentation (recommended by PyTorch for large models)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import numpy as np
 import optuna
@@ -224,6 +227,14 @@ def run_optuna_search(model_class, feat_dim, d_traded, m_brownian, sigma,
     """
     trial_log = []
 
+    # For memory-hungry models (LSTM), keep data on CPU and move per-trial
+    _needs_isolate = model_class == "LSTM"
+
+    def _data_to(data, target_device):
+        """Move all tensors in a data dict to target_device."""
+        return {k: v.to(target_device) if isinstance(v, torch.Tensor) else v
+                for k, v in data.items()}
+
     def _run_trial_inner(depth, width, act, lr, batch_size):
         """Run a single trial; returns (val_cvar, val_mse)."""
         set_seed(args.seed_arch)
@@ -235,6 +246,14 @@ def run_optuna_search(model_class, feat_dim, d_traded, m_brownian, sigma,
             "use_controller": bool(args.use_controller),
             "tbptt": args.tbptt if model_class == "LSTM" else 0,
         }
+
+        # Move data to GPU only for this trial (LSTM isolation)
+        if _needs_isolate:
+            t_data = _data_to(train_data, device)
+            v_data = _data_to(val_data, device)
+        else:
+            t_data = train_data
+            v_data = val_data
 
         nn1 = ctrl = model = None
         try:
@@ -248,7 +267,7 @@ def run_optuna_search(model_class, feat_dim, d_traded, m_brownian, sigma,
                         0.1, args.delta_clip, device,
                     )
                 t_losses, v_losses = train_hedger(
-                    nn1, ctrl, train_data, val_data, train_cfg, device
+                    nn1, ctrl, t_data, v_data, train_cfg, device
                 )
                 val_cvar = v_losses[-1] if v_losses else float("inf")
                 with torch.no_grad():
@@ -256,11 +275,11 @@ def run_optuna_search(model_class, feat_dim, d_traded, m_brownian, sigma,
                     if ctrl is not None:
                         ctrl.eval()
                     V_T, _ = forward_portfolio(
-                        nn1, ctrl, val_data["features"], val_data["Z_intrinsic"],
-                        val_data["dS"], use_controller=bool(args.use_controller),
+                        nn1, ctrl, v_data["features"], v_data["Z_intrinsic"],
+                        v_data["dS"], use_controller=bool(args.use_controller),
                         tbptt=0,
                     )
-                    e = terminal_error(V_T, val_data["H_tilde"])
+                    e = terminal_error(V_T, v_data["H_tilde"])
                     val_mse = (e ** 2).mean().item()
 
             else:  # DBSDE
@@ -268,23 +287,29 @@ def run_optuna_search(model_class, feat_dim, d_traded, m_brownian, sigma,
                                   depth, width, act, 0.1, device)
                 train_cfg["substeps"] = 0
                 t_losses, v_losses = train_bsde(
-                    model, train_data, val_data, train_cfg, device
+                    model, t_data, v_data, train_cfg, device
                 )
                 val_cvar = v_losses[-1] if v_losses else float("inf")
                 with torch.no_grad():
                     model.eval()
                     Y_T, _, _ = model(
-                        val_data["features"], val_data["dW"],
-                        val_data["time_grid"], substeps=0,
+                        v_data["features"], v_data["dW"],
+                        v_data["time_grid"], substeps=0,
                     )
-                    e = terminal_error(Y_T, val_data["H_tilde"])
+                    e = terminal_error(Y_T, v_data["H_tilde"])
                     val_mse = (e ** 2).mean().item()
 
             return val_cvar, val_mse
 
         finally:
             del nn1, ctrl, model
+            # For LSTM: delete GPU copies of data, wipe everything
+            if _needs_isolate:
+                del t_data, v_data
             clear_gpu_cache()
+
+    # Cache: skip duplicate hyperparameter combos
+    _seen_configs = {}   # (depth, width, act, lr) -> (val_cvar, val_mse)
 
     def objective(trial):
         depth = trial.suggest_categorical("depth", args.depth_grid)
@@ -292,28 +317,43 @@ def run_optuna_search(model_class, feat_dim, d_traded, m_brownian, sigma,
         act = trial.suggest_categorical("act_schedule", args.act_schedules)
         lr = trial.suggest_categorical("lr", args.lrs)
 
-        # Try full batch; on OOM retry once with half batch
-        batch_size = args.batch_size
-        try:
-            val_cvar, val_mse = _run_trial_inner(depth, width, act, lr, batch_size)
-        except RuntimeError as ex:
-            if "out of memory" in str(ex).lower():
-                clear_gpu_cache()
-                batch_size = batch_size // 2
-                print(f"    OOM -> retrying with batch_size={batch_size}")
-                try:
-                    val_cvar, val_mse = _run_trial_inner(
-                        depth, width, act, lr, batch_size,
-                    )
-                except RuntimeError as ex2:
-                    print(f"    FAILED (retry): {ex2}")
-                    clear_gpu_cache()
-                    val_cvar, val_mse = float("inf"), float("inf")
-            else:
-                print(f"    FAILED: {ex}")
-                clear_gpu_cache()
-                val_cvar, val_mse = float("inf"), float("inf")
+        # Skip if this exact config already ran
+        config_key = (depth, width, act, lr)
+        if config_key in _seen_configs:
+            val_cvar, val_mse = _seen_configs[config_key]
+            trial.set_user_attr("val_MSE", val_mse)
+            trial_log.append({
+                "depth": depth, "width": width, "act_schedule": act, "lr": lr,
+                "val_CVaR95": val_cvar, "val_MSE": val_mse,
+            })
+            print(f"    Trial {trial.number}: depth={depth} width={width} "
+                  f"act={act} lr={lr} -> CVaR95={val_cvar:.6f}  MSE={val_mse:.6f}  [cached]")
+            return val_cvar
 
+        # Try full batch; on OOM keep halving batch (up to 3 retries)
+        batch_size = args.batch_size
+        min_batch = max(64, args.batch_size // 16)
+        val_cvar, val_mse = float("inf"), float("inf")
+        while batch_size >= min_batch:
+            try:
+                val_cvar, val_mse = _run_trial_inner(
+                    depth, width, act, lr, batch_size,
+                )
+                break  # success
+            except RuntimeError as ex:
+                if "out of memory" in str(ex).lower():
+                    clear_gpu_cache()
+                    batch_size = batch_size // 2
+                    if batch_size >= min_batch:
+                        print(f"    OOM -> retrying with batch_size={batch_size}")
+                    else:
+                        print(f"    FAILED: OOM even at batch_size={batch_size * 2}")
+                else:
+                    print(f"    FAILED: {ex}")
+                    clear_gpu_cache()
+                    break
+
+        _seen_configs[config_key] = (val_cvar, val_mse)
         trial.set_user_attr("val_MSE", val_mse)
 
         trial_log.append({
@@ -356,6 +396,13 @@ def run_optuna_search(model_class, feat_dim, d_traded, m_brownian, sigma,
     remaining = max(0, n_trials - done)
     if done > 0:
         print(f"  Resuming: {done}/{n_trials} trials already complete")
+        # Seed the dedup cache from previously completed trials
+        for t in study.trials:
+            if t.state == optuna.trial.TrialState.COMPLETE:
+                key = (t.params["depth"], t.params["width"],
+                       t.params["act_schedule"], t.params["lr"])
+                mse = t.user_attrs.get("val_MSE", float("inf"))
+                _seen_configs[key] = (t.value, mse)
     if remaining > 0:
         study.optimize(objective, n_trials=remaining, show_progress_bar=False)
 
@@ -780,11 +827,23 @@ def run_pipeline(market_label, args, device, S_tilde, dW, time_grid, sigma,
 
             print(f"\n--- {model_class} ---")
             if model_class in ("FNN", "LSTM"):
+                # LSTM isolation: pass CPU data so each trial gets a fresh GPU
+                if model_class == "LSTM":
+                    _train = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                              for k, v in hedger_train.items()}
+                    _val = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                            for k, v in hedger_val.items()}
+                    clear_gpu_cache()
+                else:
+                    _train, _val = hedger_train, hedger_val
                 best, tlog = run_optuna_search(
                     model_class, feat_dim, args.d_traded, m_brownian, sigma,
-                    hedger_train, hedger_val, args, device,
+                    _train, _val, args, device,
                     output_dir=output_dir,
                 )
+                if model_class == "LSTM":
+                    del _train, _val
+                    clear_gpu_cache()
             else:
                 best, tlog = run_optuna_search(
                     model_class, feat_dim, args.d_traded, m_brownian, sigma,
@@ -797,6 +856,10 @@ def run_pipeline(market_label, args, device, S_tilde, dW, time_grid, sigma,
             save_json({"best_configs": best_configs, "trial_logs": trial_logs},
                       stage1_path)
             print(f"  [saved Stage 1 progress: {list(best_configs.keys())}]")
+
+            # Full memory wipe between models so next model starts fresh
+            clear_gpu_cache()
+            print(f"  [GPU memory cleared after {model_class}]")
 
     # Generate Optuna validation loss plots per model
     plots_val_dir = os.path.join(output_dir, "plots_val")
@@ -882,6 +945,10 @@ def run_pipeline(market_label, args, device, S_tilde, dW, time_grid, sigma,
             )
             _write_csv_summary(all_agg, os.path.join(output_dir, "val_metrics_summary.csv"))
             print(f"  [saved Stage 2 progress: {list(all_agg.keys())}]")
+
+            # Full memory wipe between models so next model starts fresh
+            clear_gpu_cache()
+            print(f"  [GPU memory cleared after {model_class}]")
 
     # Restore original output_dir
     args.output_dir = orig_output_dir

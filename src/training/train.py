@@ -10,6 +10,7 @@ Supports:
 import math
 import torch
 import torch.nn as nn
+from torch.amp import autocast, GradScaler
 from src.training.losses import (
     hedging_loss, bsde_loss, elastic_net_penalty,
     shortfall, cvar, terminal_error,
@@ -133,6 +134,10 @@ def train_hedger(nn1, controller, train_data, val_data, config, device="cpu"):
         params += list(controller.parameters())
     optimizer = torch.optim.Adam(params, lr=lr)
 
+    # Mixed precision: use AMP on CUDA to halve LSTM memory
+    use_amp = device != "cpu" and torch.cuda.is_available()
+    scaler = GradScaler("cuda") if use_amp else None
+
     stopper = EarlyStopping(patience=patience, mode="min")
     train_losses = []
     val_losses = []
@@ -155,23 +160,31 @@ def train_hedger(nn1, controller, train_data, val_data, config, device="cpu"):
             ds = train_data["dS"][idx]
             H = train_data["H_tilde"][idx]
 
-            V_T, _ = forward_portfolio(
-                nn1, controller, feat, Z_int, ds,
-                use_controller=use_ctrl, tbptt=tbptt,
-            )
-
-            loss = hedging_loss(V_T, H, alpha=alpha, beta=beta, cvar_q=cvar_q)
-
-            # Elastic net on all models
-            reg = elastic_net_penalty(nn1, l1=l1, l2=l2)
-            if use_ctrl:
-                reg = reg + elastic_net_penalty(controller, l1=l1, l2=l2)
-            loss = loss + reg
-
             optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, max_norm=10.0)
-            optimizer.step()
+
+            with autocast("cuda", enabled=use_amp):
+                V_T, _ = forward_portfolio(
+                    nn1, controller, feat, Z_int, ds,
+                    use_controller=use_ctrl, tbptt=tbptt,
+                )
+                loss = hedging_loss(V_T, H, alpha=alpha, beta=beta, cvar_q=cvar_q)
+
+                # Elastic net on all models
+                reg = elastic_net_penalty(nn1, l1=l1, l2=l2)
+                if use_ctrl:
+                    reg = reg + elastic_net_penalty(controller, l1=l1, l2=l2)
+                loss = loss + reg
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(params, max_norm=10.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, max_norm=10.0)
+                optimizer.step()
 
             epoch_loss += loss.item()
             n_batches += 1

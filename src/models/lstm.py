@@ -2,9 +2,11 @@
 
 Single forward pass over the entire sequence (no Python loop for outputs).
 Pre-MLP and head-MLP use the activation schedule.
+Gradient checkpointing reduces memory by ~40-60% at ~20% compute cost.
 """
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from src.models.fnn import get_activation
 
 
@@ -45,6 +47,11 @@ class LSTMHedger(nn.Module):
             nn.Linear(hidden_size, d_traded),
         )
 
+    def _lstm_forward(self, h):
+        """LSTM forward — separated for gradient checkpointing."""
+        output, _ = self.lstm(h)
+        return output
+
     def forward(self, x):
         """Single forward pass over full sequence.
 
@@ -55,7 +62,12 @@ class LSTMHedger(nn.Module):
             delta: [batch, N, d_traded]
         """
         h = self.pre_mlp(x)        # [batch, N, hidden]
-        output, _ = self.lstm(h)    # [batch, N, hidden]
+        # Gradient checkpointing: recompute LSTM activations during backward
+        # instead of storing them all — saves ~40-60% memory
+        if self.training and h.requires_grad:
+            output = checkpoint(self._lstm_forward, h, use_reentrant=False)
+        else:
+            output = self._lstm_forward(h)
         delta = self.head(output)   # [batch, N, d_traded]
         return delta
 
