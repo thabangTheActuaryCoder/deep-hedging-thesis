@@ -227,8 +227,9 @@ def run_optuna_search(model_class, feat_dim, d_traded, m_brownian, sigma,
     """
     trial_log = []
 
-    # For memory-hungry models (LSTM), keep data on CPU and move per-trial
-    _needs_isolate = model_class == "LSTM"
+    # Keep data on CPU and move to device per-trial; wipe after each trial
+    # so every trial starts with a clean memory slate (works on laptop + GPU)
+    _needs_isolate = True
 
     def _data_to(data, target_device):
         """Move all tensors in a data dict to target_device."""
@@ -827,29 +828,33 @@ def run_pipeline(market_label, args, device, S_tilde, dW, time_grid, sigma,
 
             print(f"\n--- {model_class} ---")
             if model_class in ("FNN", "LSTM"):
-                # LSTM isolation: pass CPU data so each trial gets a fresh GPU
-                if model_class == "LSTM":
-                    _train = {k: v.cpu() if isinstance(v, torch.Tensor) else v
-                              for k, v in hedger_train.items()}
-                    _val = {k: v.cpu() if isinstance(v, torch.Tensor) else v
-                            for k, v in hedger_val.items()}
-                    clear_gpu_cache()
-                else:
-                    _train, _val = hedger_train, hedger_val
+                # Per-trial isolation: pass CPU data so each trial starts clean
+                _train = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                          for k, v in hedger_train.items()}
+                _val = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                        for k, v in hedger_val.items()}
+                clear_gpu_cache()
                 best, tlog = run_optuna_search(
                     model_class, feat_dim, args.d_traded, m_brownian, sigma,
                     _train, _val, args, device,
                     output_dir=output_dir,
                 )
-                if model_class == "LSTM":
-                    del _train, _val
-                    clear_gpu_cache()
+                del _train, _val
+                clear_gpu_cache()
             else:
+                # BSDE also gets per-trial isolation
+                _train = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                          for k, v in bsde_train.items()}
+                _val = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                        for k, v in bsde_val.items()}
+                clear_gpu_cache()
                 best, tlog = run_optuna_search(
                     model_class, feat_dim, args.d_traded, m_brownian, sigma,
-                    bsde_train, bsde_val, args, device, time_grid=time_grid,
+                    _train, _val, args, device, time_grid=time_grid,
                     output_dir=output_dir,
                 )
+                del _train, _val
+                clear_gpu_cache()
             best_configs[model_class] = best
             trial_logs[model_class] = tlog
 
