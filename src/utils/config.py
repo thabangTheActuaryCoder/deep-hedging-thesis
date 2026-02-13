@@ -20,10 +20,10 @@ class ExperimentConfig:
     latent_dim: int = 16
     sig_level: int = 2
     vae_epochs: int = 50
+    vae_augment_ratio: float = 0.5
 
-    # Architecture grid
-    depth_grid: List[int] = field(default_factory=lambda: [3, 5, 7])
-    width_grid: List[int] = field(default_factory=lambda: [64, 128, 256])
+    # Architecture grid (FNN cone)
+    start_width_grid: List[int] = field(default_factory=lambda: [16, 32, 64, 128])
     act_schedules: List[str] = field(
         default_factory=lambda: [
             "relu_all", "tanh_all", "alt_relu_tanh", "alt_tanh_relu"
@@ -37,32 +37,17 @@ class ExperimentConfig:
     batch_size: int = 2048
     dropout: float = 0.1
 
-    # Regularization
-    l1: float = 0.0
-    l2: float = 1e-4
-
-    # Loss
-    objective: str = "cvar_shortfall"
+    # Loss (super-hedging)
+    lambda_short: float = 10.0
+    lambda_over: float = 1.0
     cvar_q: float = 0.95
-    alpha: float = 1.0
-    beta: float = 1.0
-
-    # Controller
-    use_controller: bool = True
-    delta_clip: float = 5.0
-
-    # LSTM
-    tbptt: int = 50
 
     # Seeds
     seed_arch: int = 0
     seeds: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
 
-    # DBSDE
-    substeps: List[int] = field(default_factory=lambda: [0, 5, 10])
-
     # Market model
-    market_model: str = "both"  # "gbm", "heston", or "both"
+    market_model: str = "gbm"
     market_config: str = ""  # path to market_params JSON (empty = use defaults)
 
     # Paths
