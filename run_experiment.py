@@ -29,7 +29,8 @@ from src.sim.simulate_market import (
     simulate_market, compute_european_put_payoff,
     compute_intrinsic_process, split_data,
 )
-from src.sim.calibration import load_market_params
+from src.sim.calibration import load_market_params, load_heston_params
+from src.sim.simulate_heston import simulate_heston_market
 from src.features.build_features import build_features_for_model, build_base_features
 from src.features.vae import train_path_vae, augment_training_data
 from src.models.fnn import FNNHedger, cone_layer_widths
@@ -67,6 +68,8 @@ def parse_args():
     p.add_argument("--K", type=float, default=1.0)
     p.add_argument("--r", type=float, default=0.0)
     p.add_argument("--market_config", type=str, default="")
+    p.add_argument("--market_model", type=str, default="both",
+                   choices=["gbm", "heston", "both"])
 
     # Features
     p.add_argument("--latent_dim", type=int, default=16)
@@ -567,9 +570,9 @@ def run_regression_eval(feat_dim, d_traded, reg_train_data,
 
 def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
                  H_tilde, Z_intrinsic, train_idx, val_idx, test_idx,
-                 split_hash, vols):
-    """Run the full training pipeline (GBM market)."""
-    output_dir = os.path.join(args.output_dir, "gbm")
+                 split_hash, vols, market_label="gbm"):
+    """Run the full training pipeline for a given market model."""
+    output_dir = os.path.join(args.output_dir, market_label)
     for sub in ["plots", "plots_val", "plots_3d", "checkpoints", "run_configs",
                 "data"]:
         ensure_dir(os.path.join(output_dir, sub))
@@ -577,7 +580,7 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
     d_traded = args.d_traded
 
     print(f"\n{'='*60}")
-    print(f"  Pipeline: GBM market")
+    print(f"  Pipeline: {market_label.upper()} market")
     print(f"{'='*60}")
 
     save_json({"train": train_idx.tolist(), "val": val_idx.tolist(),
@@ -799,7 +802,7 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
     print(f"  Best model: {best_model}")
 
     plot_summary_table(all_agg, output_dir=plots_val_dir,
-                       title="Model Comparison – GBM (Validation Set)")
+                       title=f"Model Comparison – {market_label.upper()} (Validation Set)")
     plot_validation_summary(all_agg, best_model, output_dir=plots_val_dir)
     plot_model_comparison_bars(all_agg, output_dir=plots_val_dir)
 
@@ -825,7 +828,7 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
         "best_configs": best_configs,
         "aggregated_val_metrics": all_agg,
         "best_model": best_model,
-        "market_model": "gbm",
+        "market_model": market_label,
         "config": {
             "paths": args.paths, "N": args.N, "T": args.T,
             "d_traded": args.d_traded, "K": args.K, "r": args.r,
@@ -862,32 +865,103 @@ def main():
     print(f"Paths={args.paths}  Split hash={split_hash}")
     print(f"Train={len(train_idx)}  Val={len(val_idx)}  Test={len(test_idx)}")
 
+    market_results = {}
+
     # ── GBM pipeline ──
-    print("\n" + "=" * 60)
-    print("  MARKET MODEL: GBM (calibrated)")
-    print("=" * 60)
+    if args.market_model in ("gbm", "both"):
+        print("\n" + "=" * 60)
+        print("  MARKET MODEL: GBM (calibrated)")
+        print("=" * 60)
 
-    vols = gbm_params["vols"]
-    extra_vol = gbm_params.get("extra_vol", 0.06)
+        vols = gbm_params["vols"]
+        extra_vol = gbm_params.get("extra_vol", 0.06)
 
-    S_tilde, dW, time_grid, sigma = simulate_market(
-        args.paths, args.N, args.T, args.d_traded, args.m_brownian,
-        args.r, vols, extra_vol=extra_vol,
-        seed=args.seed_arch, device="cpu",
-    )
-    H_tilde = compute_european_put_payoff(S_tilde, args.K, args.r, args.T)
-    Z_intrinsic = compute_intrinsic_process(S_tilde, args.K, args.r, time_grid)
+        S_tilde, dW, time_grid, sigma = simulate_market(
+            args.paths, args.N, args.T, args.d_traded, args.m_brownian,
+            args.r, vols, extra_vol=extra_vol,
+            seed=args.seed_arch, device="cpu",
+        )
+        H_tilde = compute_european_put_payoff(S_tilde, args.K, args.r, args.T)
+        Z_intrinsic = compute_intrinsic_process(S_tilde, args.K, args.r, time_grid)
 
-    print(f"  GBM: r={args.r}, vols={vols}, extra_vol={extra_vol}")
+        print(f"  GBM: r={args.r}, vols={vols}, extra_vol={extra_vol}")
 
-    run_pipeline(
-        args, device, S_tilde, dW, time_grid, sigma,
-        H_tilde, Z_intrinsic, train_idx, val_idx, test_idx, split_hash,
-        vols,
-    )
+        gbm_agg, gbm_comp = run_pipeline(
+            args, device, S_tilde, dW, time_grid, sigma,
+            H_tilde, Z_intrinsic, train_idx, val_idx, test_idx, split_hash,
+            vols, market_label="gbm",
+        )
+        market_results["gbm"] = {"agg": gbm_agg, "comparison": gbm_comp}
+        del S_tilde, dW, H_tilde, Z_intrinsic
+        clear_gpu_cache()
+
+    # ── Heston pipeline ──
+    if args.market_model in ("heston", "both"):
+        heston_params = load_heston_params(config_path)
+        heston_r = heston_params.get("r", args.r)
+        heston_K = heston_params.get("K", args.K)
+        heston_T = heston_params.get("T", args.T)
+        extra_vol_h = gbm_params.get("extra_vol", 0.06)
+
+        print("\n" + "=" * 60)
+        print("  MARKET MODEL: Heston (stochastic volatility)")
+        print("=" * 60)
+        print(f"  Heston: kappa={heston_params['kappa']}, "
+              f"theta={heston_params['theta']}, xi={heston_params['xi']}, "
+              f"rho={heston_params['rho']}, v0={heston_params['v0']}")
+
+        S_tilde_h, dW_h, time_grid_h, sigma_avg_h, V_paths_h = \
+            simulate_heston_market(
+                args.paths, args.N, heston_T, args.d_traded, heston_params,
+                r=heston_r, extra_vol=extra_vol_h,
+                seed=args.seed_arch, device="cpu",
+            )
+        H_tilde_h = compute_european_put_payoff(S_tilde_h, heston_K, heston_r, heston_T)
+        Z_intrinsic_h = compute_intrinsic_process(S_tilde_h, heston_K, heston_r, time_grid_h)
+
+        # Use sqrt(theta) as effective vols for BS delta proxy
+        heston_vols = [math.sqrt(t) for t in heston_params["theta"]]
+
+        heston_agg, heston_comp = run_pipeline(
+            args, device, S_tilde_h, dW_h, time_grid_h, sigma_avg_h,
+            H_tilde_h, Z_intrinsic_h, train_idx, val_idx, test_idx,
+            split_hash, heston_vols, market_label="heston",
+        )
+        market_results["heston"] = {"agg": heston_agg, "comparison": heston_comp}
+        del S_tilde_h, dW_h, H_tilde_h, Z_intrinsic_h
+        clear_gpu_cache()
+
+    # ── Cross-market comparison ──
+    if len(market_results) == 2:
+        print("\n" + "=" * 60)
+        print("  CROSS-MARKET COMPARISON: GBM vs Heston")
+        print("=" * 60)
+        cross_dir = os.path.join(args.output_dir, "cross_market")
+        ensure_dir(cross_dir)
+        _write_cross_market_summary(market_results, cross_dir)
 
     print("\n=== All Done ===")
     print(f"Results saved to {args.output_dir}/")
+
+
+def _write_cross_market_summary(market_results, output_dir):
+    """Write cross-market comparison JSON and CSV."""
+    summary = {}
+    for mkt, data in market_results.items():
+        summary[mkt] = data["agg"]
+    save_json(summary, os.path.join(output_dir, "cross_market_metrics.json"))
+
+    # Also save terminal errors per model per market for plotting
+    errors = {}
+    for mkt, data in market_results.items():
+        errors[mkt] = {}
+        for model_name, comp in data["comparison"].items():
+            V_T = comp["V_T"]
+            H = comp["H_tilde"]
+            e = terminal_error(V_T, H).numpy()
+            errors[mkt][model_name] = e.tolist()
+    save_json(errors, os.path.join(output_dir, "cross_market_errors.json"))
+    print(f"  Cross-market summary saved to {output_dir}/")
 
 
 def _write_csv_summary(all_agg, path):
