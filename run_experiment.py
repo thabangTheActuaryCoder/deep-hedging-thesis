@@ -6,7 +6,7 @@ Two-stage bias control protocol:
   Stage 2: Seed robustness on best configs with multiple seeds
 
 Models: FNN (cone) + GRU (neural) + OLS Regression (closed-form)
-All models output 1 scalar -> sigmoid allocation -> super-hedging loss.
+FNN: 1 output -> sigmoid allocation. GRU/Regression: d_traded outputs -> direct positions.
 VAE used for path augmentation (not feature extraction).
 """
 import argparse
@@ -75,9 +75,11 @@ def parse_args():
 
     # Architecture grid (FNN cone)
     p.add_argument("--start_width_grid", type=int, nargs="+", default=[16, 32, 64, 128])
+    p.add_argument("--lrs", type=float, nargs="+", default=[3e-4, 1e-3, 3e-3])
+
+    # GRU activation schedule
     p.add_argument("--act_schedules", type=str, nargs="+",
                    default=["relu_all", "tanh_all", "alt_relu_tanh", "alt_tanh_relu"])
-    p.add_argument("--lrs", type=float, nargs="+", default=[3e-4, 1e-3, 3e-3])
 
     # GRU grid
     p.add_argument("--gru_num_layers_grid", type=int, nargs="+", default=[1, 2, 3])
@@ -123,18 +125,20 @@ def parse_args():
 # Model factories
 # ──────────────────────────────────────────────
 
-def make_fnn(feat_dim, start_width, act_schedule, dropout, device):
+def make_fnn(feat_dim, start_width, dropout, device):
     return FNNHedger(feat_dim, start_width=start_width,
-                     act_schedule=act_schedule, dropout=dropout).to(device)
+                     dropout=dropout).to(device)
 
 
-def make_gru(feat_dim, num_layers, hidden_size, act_schedule, dropout, device):
+def make_gru(feat_dim, num_layers, hidden_size, act_schedule, dropout, device,
+             d_traded=2):
     return GRUHedger(feat_dim, num_layers=num_layers, hidden_size=hidden_size,
-                     act_schedule=act_schedule, dropout=dropout).to(device)
+                     act_schedule=act_schedule, dropout=dropout,
+                     d_traded=d_traded).to(device)
 
 
-def make_regression(feat_dim, device):
-    return RegressionHedger(feat_dim).to(device)
+def make_regression(feat_dim, d_traded, device):
+    return RegressionHedger(feat_dim, d_traded=d_traded).to(device)
 
 
 # ──────────────────────────────────────────────
@@ -174,22 +178,29 @@ def prepare_hedger_data(features, S_tilde_split, H_split, V_0, device):
     }
 
 
-def prepare_regression_data(features, S_tilde, K, r, T, time_grid, sigma_avg, device):
+def prepare_regression_data(features, S_tilde, K, r, T, time_grid, vols, device):
     """Prepare OLS regression training data.
 
-    Target: BS put delta as proxy for h_t.
+    Target: BS put delta per asset as proxy for h_t.
     Features: flattened across time steps.
     """
     n_paths, N_plus_1, feat_dim = features.shape
     N = N_plus_1 - 1
+    d_traded = S_tilde.shape[2]
 
     # Flatten features: [n_paths * N, feat_dim]
     X = features[:, :N, :].reshape(-1, feat_dim)
 
-    # Compute BS delta target for each path x step
-    S = S_tilde[:, :N, 0]  # [n_paths, N] first asset
+    # Compute BS delta target per asset
     tau = (T - time_grid[:N]).unsqueeze(0).expand(n_paths, -1)
-    y = bs_put_delta(S.reshape(-1), K, r, T, sigma_avg, tau.reshape(-1))
+    tau_flat = tau.reshape(-1)
+
+    deltas = []
+    for j in range(d_traded):
+        S_j = S_tilde[:, :N, j].reshape(-1)
+        delta_j = bs_put_delta(S_j, K, r, T, vols[j], tau_flat)
+        deltas.append(delta_j)
+    y = torch.stack(deltas, dim=1)  # [n_paths * N, d_traded]
 
     return {"features": X, "target": y}
 
@@ -238,11 +249,12 @@ def run_optuna_search(model_class, feat_dim, d_traded,
         try:
             if model_class == "FNN":
                 model = make_fnn(feat_dim, trial_params["start_width"],
-                                 trial_params["act_schedule"], 0.1, device)
+                                 0.1, device)
             else:  # GRU
                 model = make_gru(feat_dim, trial_params["num_layers"],
                                  trial_params["hidden_size"],
-                                 trial_params["act_schedule"], 0.1, device)
+                                 trial_params["act_schedule"], 0.1, device,
+                                 d_traded=d_traded)
 
             t_losses, v_losses = train_hedger(
                 model, t_data, v_data, train_cfg, device
@@ -267,10 +279,9 @@ def run_optuna_search(model_class, feat_dim, d_traded,
     def objective(trial):
         if model_class == "FNN":
             start_width = trial.suggest_categorical("start_width", args.start_width_grid)
-            act = trial.suggest_categorical("act_schedule", args.act_schedules)
             lr = trial.suggest_categorical("lr", args.lrs)
-            config_key = (start_width, act, lr)
-            trial_params = {"start_width": start_width, "act_schedule": act, "lr": lr}
+            config_key = (start_width, lr)
+            trial_params = {"start_width": start_width, "lr": lr}
         else:  # GRU
             num_layers = trial.suggest_categorical("num_layers", args.gru_num_layers_grid)
             hidden_size = trial.suggest_categorical("hidden_size", args.gru_hidden_size_grid)
@@ -327,7 +338,7 @@ def run_optuna_search(model_class, feat_dim, d_traded,
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     if model_class == "FNN":
-        total_configs = (len(args.start_width_grid) * len(args.act_schedules) * len(args.lrs))
+        total_configs = len(args.start_width_grid) * len(args.lrs)
     else:
         total_configs = (len(args.gru_num_layers_grid) * len(args.gru_hidden_size_grid)
                          * len(args.act_schedules) * len(args.lrs))
@@ -357,7 +368,7 @@ def run_optuna_search(model_class, feat_dim, d_traded,
         for t in study.trials:
             if t.state == optuna.trial.TrialState.COMPLETE:
                 if model_class == "FNN":
-                    key = (t.params["start_width"], t.params["act_schedule"], t.params["lr"])
+                    key = (t.params["start_width"], t.params["lr"])
                 else:
                     key = (t.params["num_layers"], t.params["hidden_size"],
                            t.params["act_schedule"], t.params["lr"])
@@ -432,11 +443,12 @@ def run_seed_robustness(model_class, best_config, feat_dim, d_traded,
 
         if model_class == "FNN":
             model = make_fnn(feat_dim, best_config["start_width"],
-                             best_config["act_schedule"], 0.1, device)
+                             0.1, device)
         elif model_class == "GRU":
             model = make_gru(feat_dim, best_config["num_layers"],
                              best_config["hidden_size"],
-                             best_config["act_schedule"], 0.1, device)
+                             best_config["act_schedule"], 0.1, device,
+                             d_traded=d_traded)
         else:
             raise ValueError(f"Unexpected model_class for seed robustness: {model_class}")
 
@@ -507,7 +519,7 @@ def run_regression_eval(feat_dim, d_traded, reg_train_data,
     metric_path = os.path.join(args.output_dir, "run_configs",
                                "Regression_seed0_metrics.json")
 
-    model = make_regression(feat_dim, device)
+    model = make_regression(feat_dim, d_traded, device)
     train_regression(model, reg_train_data, {}, device)
 
     model.eval()
@@ -554,7 +566,7 @@ def run_regression_eval(feat_dim, d_traded, reg_train_data,
 
 def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
                  H_tilde, Z_intrinsic, train_idx, val_idx, test_idx,
-                 split_hash, sigma_avg_scalar):
+                 split_hash, vols):
     """Run the full training pipeline (GBM market)."""
     output_dir = os.path.join(args.output_dir, "gbm")
     for sub in ["plots", "plots_val", "plots_3d", "checkpoints", "run_configs",
@@ -605,6 +617,7 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
         H_train_aug = H_train
 
     # Compute V_0 (BS price)
+    sigma_avg_scalar = vols[0]  # first asset vol for BS price
     V_0_val = get_V0(S_tilde_val, args.K, args.r, args.T, sigma_avg_scalar, len(val_idx))
     V_0_train = get_V0(S_tilde_aug, args.K, args.r, args.T, sigma_avg_scalar, n_aug)
 
@@ -757,7 +770,7 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
 
     reg_train_data = prepare_regression_data(
         mf["train"], S_tilde_aug, args.K, args.r, args.T,
-        time_grid, sigma_avg_scalar, device,
+        time_grid, vols, device,
     )
 
     reg_agg, reg_comp = run_regression_eval(
@@ -774,12 +787,14 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
     # ── Validation Analysis ──
     print(f"\n=== Validation Analysis ===")
 
-    best_model = min(
-        all_agg.keys(),
-        key=lambda m: (all_agg[m]["CVaR95_shortfall"]["mean"]
-                        if isinstance(all_agg[m].get("CVaR95_shortfall"), dict)
-                        else float("inf")),
-    )
+    def _best_key(m):
+        """MAE (primary), MSE (secondary tiebreaker)."""
+        agg = all_agg[m]
+        mae = agg["MAE"]["mean"] if isinstance(agg.get("MAE"), dict) else float("inf")
+        mse = agg["MSE"]["mean"] if isinstance(agg.get("MSE"), dict) else float("inf")
+        return (mae, mse)
+
+    best_model = min(all_agg.keys(), key=_best_key)
     print(f"  Best model: {best_model}")
 
     plot_summary_table(all_agg, output_dir=plots_val_dir,
@@ -853,7 +868,6 @@ def main():
 
     vols = gbm_params["vols"]
     extra_vol = gbm_params.get("extra_vol", 0.06)
-    sigma_avg_scalar = vols[0]  # use first asset's vol for BS price
 
     S_tilde, dW, time_grid, sigma = simulate_market(
         args.paths, args.N, args.T, args.d_traded, args.m_brownian,
@@ -868,7 +882,7 @@ def main():
     run_pipeline(
         args, device, S_tilde, dW, time_grid, sigma,
         H_tilde, Z_intrinsic, train_idx, val_idx, test_idx, split_hash,
-        sigma_avg_scalar,
+        vols,
     )
 
     print("\n=== All Done ===")

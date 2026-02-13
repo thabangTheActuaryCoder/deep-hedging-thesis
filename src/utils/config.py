@@ -24,11 +24,6 @@ class ExperimentConfig:
 
     # Architecture grid (FNN cone)
     start_width_grid: List[int] = field(default_factory=lambda: [16, 32, 64, 128])
-    act_schedules: List[str] = field(
-        default_factory=lambda: [
-            "relu_all", "tanh_all", "alt_relu_tanh", "alt_tanh_relu"
-        ]
-    )
     lrs: List[float] = field(default_factory=lambda: [3e-4, 1e-3, 3e-3])
 
     # Training

@@ -4,8 +4,13 @@ Tests cover:
   - No look-ahead in features
   - Self-financing portfolio constraint
   - Reproducibility (same seed -> identical outputs)
-  - Controller causality (NN2 inputs at step k exclude future data)
+  - GRU consistency (unidirectional output invariance)
+  - Sigmoid allocation (weights sum to 1)
+  - OLS fit/predict
+  - Super-hedging loss asymmetry
+  - FNN cone depth auto-computation
   - LR grid tested as specified
+  - Direct position portfolio (GRU/Regression path)
 """
 import sys
 import os
@@ -22,11 +27,11 @@ from src.sim.simulate_market import (
 )
 from src.features.build_features import build_base_features
 from src.features.signatures import compute_signature_features
-from src.models.fnn import FNNHedger
-from src.models.lstm import LSTMHedger
-from src.models.controller import Controller
-from src.models.bsde import DeepBSDE
-from src.training.train import forward_portfolio
+from src.models.fnn import FNNHedger, cone_layer_widths
+from src.models.gru import GRUHedger
+from src.models.regression import RegressionHedger, bs_put_delta
+from src.training.train import forward_portfolio, sigmoid_allocation
+from src.training.losses import super_hedging_loss, shortfall, over_hedge
 
 
 DEVICE = "cpu"
@@ -60,12 +65,10 @@ class TestNoLookAhead:
         S_tilde, _, time_grid, _, _, _ = market_data
         base = build_base_features(S_tilde, time_grid, T)
 
-        # Modify future prices — base features at k should not change
         S_mod = S_tilde.clone()
         S_mod[:, 10:, :] = 999.0
         base_mod = build_base_features(S_mod, time_grid, T)
 
-        # Features at k=5 should be identical
         assert torch.allclose(base[:, 5, :], base_mod[:, 5, :]), \
             "Base features at k=5 changed when future prices were modified"
 
@@ -75,12 +78,10 @@ class TestNoLookAhead:
         log_prices = torch.log(S_tilde.clamp(min=1e-8))
         sig = compute_signature_features(log_prices, level=2)
 
-        # Modify future
         log_mod = log_prices.clone()
         log_mod[:, 10:, :] = 0.0
         sig_mod = compute_signature_features(log_mod, level=2)
 
-        # At k=8, signatures should match
         assert torch.allclose(sig[:, 8, :], sig_mod[:, 8, :], atol=1e-6), \
             "Signature features at k=8 changed when future data was modified"
 
@@ -99,72 +100,43 @@ class TestNoLookAhead:
 
 class TestSelfFinancing:
     def test_portfolio_update(self, market_data):
-        """V_{k+1} = V_k + Delta_k^T * (S_{k+1} - S_k)."""
-        S_tilde, _, _, _, _, Z = market_data
+        """V_{k+1} = V_k + phi_k^T * dS_k with sigmoid allocation."""
+        S_tilde, _, _, _, _, _ = market_data
         N = N_STEPS
-        dS = S_tilde[:, 1:, :] - S_tilde[:, :-1, :]
 
         set_seed(0)
         feat_dim = 8
         features = torch.randn(N_PATHS, N, feat_dim)
-        nn1 = FNNHedger(feat_dim, D_TRADED, depth=2, width=16)
-        nn1.eval()  # disable dropout for deterministic comparison
+        nn1 = FNNHedger(feat_dim, start_width=16)
+        nn1.eval()
+
+        V_0 = torch.full((N_PATHS,), 0.05)
 
         with torch.no_grad():
-            Delta = nn1(features)  # [N_PATHS, N, D_TRADED]
-
-        # Manual portfolio simulation
-        V = torch.zeros(N_PATHS)
-        for k in range(N):
-            V_new = V + (Delta[:, k, :] * dS[:, k, :]).sum(dim=1)
-            V = V_new
-
-        # Compare with forward_portfolio (no controller)
-        with torch.no_grad():
-            V_T, info = forward_portfolio(
-                nn1, None, features, Z[:, :N], dS,
-                use_controller=False, tbptt=0,
+            V_T, V_path = forward_portfolio(
+                nn1, features, S_tilde, V_0, D_TRADED,
             )
 
-        assert torch.allclose(V, V_T, atol=1e-5), \
-            "Portfolio terminal value mismatch"
-
-    def test_path_terminal_consistency(self, market_data):
-        """V_path[-1] should equal V_T from forward_portfolio."""
-        S_tilde, _, _, _, _, Z = market_data
-        N = N_STEPS
-        dS = S_tilde[:, 1:, :] - S_tilde[:, :-1, :]
-
-        set_seed(0)
-        feat_dim = 8
-        features = torch.randn(N_PATHS, N, feat_dim)
-        nn1 = FNNHedger(feat_dim, D_TRADED, depth=2, width=16)
-
-        with torch.no_grad():
-            V_T, info = forward_portfolio(
-                nn1, None, features, Z[:, :N], dS,
-                use_controller=False, tbptt=0,
-            )
-        assert torch.allclose(info["V_path"][:, -1], V_T, atol=1e-5)
+        assert torch.allclose(V_path[:, -1], V_T, atol=1e-5), \
+            "V_path[-1] != V_T from forward_portfolio"
 
     def test_no_future_prices_in_delta(self, market_data):
-        """FNN delta at step k is independent of future features."""
+        """FNN output at step k is independent of future features."""
         set_seed(0)
         feat_dim = 8
-        nn1 = FNNHedger(feat_dim, D_TRADED, depth=2, width=16)
+        nn1 = FNNHedger(feat_dim, start_width=16)
         nn1.eval()
 
         features = torch.randn(10, N_STEPS, feat_dim)
         with torch.no_grad():
-            delta_orig = nn1(features[:, 5, :]).clone()
+            h_orig = nn1(features[:, 5, :]).clone()
 
-        # Modify future features
         features[:, 6:, :] = 999.0
         with torch.no_grad():
-            delta_mod = nn1(features[:, 5, :])
+            h_mod = nn1(features[:, 5, :])
 
-        assert torch.allclose(delta_orig, delta_mod), \
-            "FNN delta at k=5 changed when future features were modified"
+        assert torch.allclose(h_orig, h_mod), \
+            "FNN output at k=5 changed when future features were modified"
 
 
 # ─────────────────────────────────────
@@ -198,14 +170,14 @@ class TestReproducibility:
     def test_model_forward_reproducibility(self):
         """Same seed -> same model init -> same output."""
         set_seed(7)
-        m1 = FNNHedger(10, 2, depth=3, width=32)
+        m1 = FNNHedger(10, start_width=32)
         m1.eval()
         x = torch.randn(5, 10)
         with torch.no_grad():
             out1 = m1(x).clone()
 
         set_seed(7)
-        m2 = FNNHedger(10, 2, depth=3, width=32)
+        m2 = FNNHedger(10, start_width=32)
         m2.eval()
         with torch.no_grad():
             out2 = m2(x)
@@ -214,46 +186,164 @@ class TestReproducibility:
 
 
 # ─────────────────────────────────────
-# Controller causality test
+# GRU consistency test
 # ─────────────────────────────────────
 
-class TestControllerCausality:
-    def test_controller_input_excludes_future(self, market_data):
-        """NN2 at step k does not receive dPL_{k+1} or S_{k+1}."""
-        S_tilde, _, _, _, _, Z = market_data
-        N = N_STEPS
-        dS = S_tilde[:, 1:, :] - S_tilde[:, :-1, :]
+class TestGRUConsistency:
+    def test_gru_full_vs_slice(self):
+        """GRU output at step k is same whether we feed full seq or slice to k+1."""
+        set_seed(0)
         feat_dim = 8
-        features = torch.randn(N_PATHS, N, feat_dim)
-
-        set_seed(0)
-        nn1 = FNNHedger(feat_dim, D_TRADED, depth=2, width=16)
-        ctrl = Controller(feat_dim, D_TRADED, depth=2, width=16)
-
-        # Run portfolio up to step 5 with original data
-        with torch.no_grad():
-            V_T_orig, info_orig = forward_portfolio(
-                nn1, ctrl, features, Z[:, :N], dS,
-                use_controller=True, tbptt=0,
-            )
-            gate_5_orig = info_orig["gate"][:, 5].clone()
-
-        # Modify future dS (steps > 5) and rerun
-        dS_mod = dS.clone()
-        dS_mod[:, 6:, :] = 0.0
-        set_seed(0)
-        nn1_2 = FNNHedger(feat_dim, D_TRADED, depth=2, width=16)
-        ctrl_2 = Controller(feat_dim, D_TRADED, depth=2, width=16)
+        gru = GRUHedger(feat_dim, num_layers=2, hidden_size=16)
+        gru.eval()
+        x = torch.randn(5, 10, feat_dim)
 
         with torch.no_grad():
-            _, info_mod = forward_portfolio(
-                nn1_2, ctrl_2, features, Z[:, :N], dS_mod,
-                use_controller=True, tbptt=0,
-            )
-            gate_5_mod = info_mod["gate"][:, 5]
+            full_out = gru(x)                # [5, 10, d_traded]
+            partial_out = gru(x[:, :6, :])   # [5, 6, d_traded]
 
-        assert torch.allclose(gate_5_orig, gate_5_mod, atol=1e-5), \
-            "Controller gate at k=5 changed when future dS was modified"
+        assert torch.allclose(full_out[:, :6, :], partial_out, atol=1e-5), \
+            "GRU output at k < 6 differs between full and partial sequence"
+
+    def test_gru_output_shape(self):
+        """GRU outputs d_traded scalars per time step."""
+        gru = GRUHedger(10, num_layers=2, hidden_size=32)
+        x = torch.randn(4, 8, 10)
+        with torch.no_grad():
+            out = gru(x)
+        assert out.shape == (4, 8, 2), f"Expected (4, 8, 2), got {out.shape}"
+
+
+# ─────────────────────────────────────
+# Sigmoid allocation test
+# ─────────────────────────────────────
+
+class TestSigmoidAllocation:
+    def test_weights_sum_to_one(self):
+        """Sigmoid allocation weights w1 + w2 = 1."""
+        h_t = torch.randn(10, 1)
+        w1 = torch.sigmoid(h_t.squeeze(-1))
+        w2 = 1.0 - w1
+        assert torch.allclose(w1 + w2, torch.ones(10), atol=1e-7), \
+            "Allocation weights do not sum to 1"
+
+    def test_sigmoid_allocation_shares(self):
+        """phi_i = w_i * V / S_i gives correct shares."""
+        h_t = torch.zeros(5, 1)  # sigmoid(0) = 0.5
+        V_t = torch.full((5,), 1.0)
+        S_t = torch.ones(5, 2)
+        phi = sigmoid_allocation(h_t, V_t, S_t)
+        # With h=0: w1=0.5, w2=0.5, phi_i = 0.5 * 1 / 1 = 0.5
+        expected = torch.full((5, 2), 0.5)
+        assert torch.allclose(phi, expected, atol=1e-6), \
+            f"Expected phi=0.5, got {phi}"
+
+
+# ─────────────────────────────────────
+# OLS Regression test
+# ─────────────────────────────────────
+
+class TestOLSRegression:
+    def test_fit_predict(self):
+        """OLS fit recovers known coefficients (multi-target)."""
+        torch.manual_seed(0)
+        X = torch.randn(100, 3)
+        beta_true = torch.tensor([[1.0, 0.2], [-0.5, 0.8], [0.3, -0.4]])
+        y = X @ beta_true + 0.01 * torch.randn(100, 2)
+
+        model = RegressionHedger(3, d_traded=2)
+        model.fit(X, y)
+
+        assert model.is_fitted
+        assert model.beta.shape == (3, 2)
+
+        # Check predictions are close
+        with torch.no_grad():
+            y_pred = model(X)
+        error = (y_pred - y).abs().mean()
+        assert error < 0.1, f"Mean prediction error {error:.4f} too large"
+
+    def test_output_shape(self):
+        """Regression output shape: [batch, N, d_traded]."""
+        model = RegressionHedger(5, d_traded=2)
+        model.fit(torch.randn(20, 5), torch.randn(20, 2))
+        x = torch.randn(4, 8, 5)
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (4, 8, 2), f"Expected (4, 8, 2), got {out.shape}"
+
+
+# ─────────────────────────────────────
+# Super-hedging loss test
+# ─────────────────────────────────────
+
+class TestSuperHedgingLoss:
+    def test_asymmetry(self):
+        """Shortfall is penalised more than over-hedge."""
+        V_T = torch.tensor([0.9, 0.9, 0.9, 0.9])  # under-hedge by 0.1
+        H_tilde = torch.ones(4)
+
+        loss_under = super_hedging_loss(V_T, H_tilde, lambda_short=10.0, lambda_over=1.0)
+
+        V_T_over = torch.tensor([1.1, 1.1, 1.1, 1.1])  # over-hedge by 0.1
+        loss_over = super_hedging_loss(V_T_over, H_tilde, lambda_short=10.0, lambda_over=1.0)
+
+        assert loss_under > loss_over, \
+            f"Under-hedge loss {loss_under:.4f} should be > over-hedge loss {loss_over:.4f}"
+
+    def test_perfect_hedge_zero_shortfall(self):
+        """Perfect hedge => zero shortfall."""
+        V_T = torch.ones(10)
+        H_tilde = torch.ones(10)
+        s = shortfall(V_T, H_tilde)
+        assert torch.allclose(s, torch.zeros(10)), \
+            "Shortfall should be zero for perfect hedge"
+
+    def test_over_hedge_positive_error(self):
+        """Over-hedge => positive over_hedge, zero shortfall."""
+        V_T = torch.full((10,), 1.5)
+        H_tilde = torch.ones(10)
+        s = shortfall(V_T, H_tilde)
+        o = over_hedge(V_T, H_tilde)
+        assert torch.allclose(s, torch.zeros(10))
+        assert torch.allclose(o, torch.full((10,), 0.5))
+
+
+# ─────────────────────────────────────
+# FNN cone depth test
+# ─────────────────────────────────────
+
+class TestConeArchitecture:
+    def test_cone_widths_64(self):
+        """start_width=64 -> [64, 32, 16, 8, 4] (depth=5)."""
+        widths = cone_layer_widths(64)
+        assert widths == [64, 32, 16, 8, 4], f"Got {widths}"
+
+    def test_cone_widths_128(self):
+        """start_width=128 -> [128, 64, 32, 16, 8, 4] (depth=6)."""
+        widths = cone_layer_widths(128)
+        assert widths == [128, 64, 32, 16, 8, 4], f"Got {widths}"
+
+    def test_cone_widths_16(self):
+        """start_width=16 -> [16, 8, 4] (depth=3)."""
+        widths = cone_layer_widths(16)
+        assert widths == [16, 8, 4], f"Got {widths}"
+
+    def test_fnn_output_dim(self):
+        """FNN outputs exactly 1 scalar per step."""
+        model = FNNHedger(10, start_width=32)
+        x = torch.randn(5, 10)
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (5, 1), f"Expected (5, 1), got {out.shape}"
+
+    def test_fnn_3d_output_dim(self):
+        """FNN sequence input: [batch, N, feat] -> [batch, N, 1]."""
+        model = FNNHedger(10, start_width=32)
+        x = torch.randn(4, 8, 10)
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (4, 8, 1), f"Expected (4, 8, 1), got {out.shape}"
 
 
 # ─────────────────────────────────────
@@ -270,28 +360,59 @@ class TestLRGrid:
 
 
 # ─────────────────────────────────────
-# LSTM consistency test
+# Direct position portfolio test
 # ─────────────────────────────────────
 
-class TestLSTMConsistency:
-    def test_lstm_full_vs_slice(self):
-        """LSTM output at step k is same whether we feed full seq or slice to k+1."""
+class TestDirectPositionPortfolio:
+    def test_gru_direct_positions(self, market_data):
+        """forward_portfolio with GRU (output_dim=2) uses direct positions path."""
+        S_tilde, _, _, _, _, _ = market_data
+        N = N_STEPS
+
         set_seed(0)
-        feat_dim = 8
-        lstm = LSTMHedger(feat_dim, D_TRADED, num_layers=2, hidden_size=16)
-        lstm.eval()  # disable dropout for deterministic comparison
-        x = torch.randn(5, 10, feat_dim)
+        feat_dim = 3
+        features = torch.randn(N_PATHS, N, feat_dim)
+        gru = GRUHedger(feat_dim, num_layers=1, hidden_size=16, d_traded=D_TRADED)
+        gru.eval()
+
+        V_0 = torch.full((N_PATHS,), 0.05)
 
         with torch.no_grad():
-            full_out = lstm(x)                # [5, 10, D_TRADED]
-            partial_out = lstm(x[:, :6, :])   # [5, 6, D_TRADED]
+            V_T, V_path = forward_portfolio(gru, features, S_tilde, V_0, D_TRADED)
 
-        # Note: LSTM output at k depends on all inputs 0..k,
-        # so slicing to k+1 should give same output at k
-        # This is NOT true for standard LSTM because of bidirectional effects,
-        # but our LSTM is unidirectional so it should hold.
-        # However, the head MLP is applied independently, so this test is valid.
-        # Actually for a forward LSTM, output[k] = f(input[0:k+1]), so
-        # feeding [0:6] should give same output[0:5] as feeding [0:10].
-        assert torch.allclose(full_out[:, :6, :], partial_out, atol=1e-5), \
-            "LSTM output at k < 6 differs between full and partial sequence"
+        # V_path[:, -1] should equal V_T
+        assert torch.allclose(V_path[:, -1], V_T, atol=1e-5), \
+            "V_path[-1] != V_T for direct position portfolio"
+
+        # Verify gains = sum of h_k * dS_k
+        with torch.no_grad():
+            h_all = gru(features)  # [batch, N, d_traded]
+        dS = S_tilde[:, 1:, :] - S_tilde[:, :-1, :]
+        gains = (h_all * dS).sum(dim=2)  # [batch, N]
+        V_T_manual = V_0 + gains.sum(dim=1)
+        assert torch.allclose(V_T, V_T_manual, atol=1e-5), \
+            "V_T from forward_portfolio doesn't match manual gains computation"
+
+    def test_direct_position_v_path(self, market_data):
+        """V_path via cumsum matches step-by-step computation."""
+        S_tilde, _, _, _, _, _ = market_data
+        N = N_STEPS
+
+        set_seed(1)
+        feat_dim = 3
+        features = torch.randn(10, N, feat_dim)
+        gru = GRUHedger(feat_dim, num_layers=1, hidden_size=8, d_traded=D_TRADED)
+        gru.eval()
+
+        V_0 = torch.full((10,), 0.1)
+
+        with torch.no_grad():
+            V_T, V_path = forward_portfolio(gru, features, S_tilde[:10], V_0, D_TRADED)
+
+        # V_path should have N+1 time steps
+        assert V_path.shape == (10, N + 1), \
+            f"Expected V_path shape (10, {N+1}), got {V_path.shape}"
+
+        # V_path[:, 0] should be V_0
+        assert torch.allclose(V_path[:, 0], V_0, atol=1e-7), \
+            "V_path[:, 0] != V_0"

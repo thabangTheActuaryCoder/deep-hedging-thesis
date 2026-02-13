@@ -1,8 +1,8 @@
-"""Loss functions for hedging and BSDE training.
+"""Loss functions for super-hedging.
 
-Primary objective: MSE + alpha * mean(shortfall) + beta * CVaR_q(shortfall)
-Shortfall s = max(H_tilde - V_T, 0) measures under-hedging.
-Negative terminal errors (V_T > H_tilde) are expected in incomplete markets.
+Primary objective: asymmetric shortfall penalisation.
+L = lambda_short * mean(shortfall) + lambda_over * mean(over_hedge)
+    + lambda_short * CVaR_q(shortfall)
 """
 import torch
 
@@ -17,6 +17,11 @@ def shortfall(V_T, H_tilde):
     return torch.clamp(H_tilde - V_T, min=0.0)
 
 
+def over_hedge(V_T, H_tilde):
+    """o = max(V_T - H_tilde, 0)."""
+    return torch.clamp(V_T - H_tilde, min=0.0)
+
+
 def cvar(losses, q=0.95):
     """CVaR_q: mean of the top (1-q) fraction of losses.
 
@@ -28,50 +33,26 @@ def cvar(losses, q=0.95):
     return sorted_losses[:k].mean()
 
 
-def hedging_loss(V_T, H_tilde, alpha=1.0, beta=1.0, cvar_q=0.95):
-    """Combined hedging loss: MSE + alpha*mean(shortfall) + beta*CVaR_q(shortfall).
+def super_hedging_loss(V_T, H_tilde, lambda_short=10.0, lambda_over=1.0,
+                       cvar_q=0.95):
+    """Super-hedging loss: asymmetric penalisation of under- vs over-hedging.
+
+    L = lambda_short * mean(shortfall) + lambda_over * mean(over_hedge)
+        + lambda_short * CVaR_q(shortfall)
 
     Args:
         V_T: [batch] terminal portfolio value
         H_tilde: [batch] discounted payoff target
-        alpha: weight on mean shortfall
-        beta: weight on CVaR shortfall
+        lambda_short: weight on shortfall terms (default 10.0)
+        lambda_over: weight on over-hedge term (default 1.0)
         cvar_q: CVaR quantile level
 
     Returns:
         loss: scalar
     """
-    e = terminal_error(V_T, H_tilde)
     s = shortfall(V_T, H_tilde)
-    mse = (e ** 2).mean()
+    o = over_hedge(V_T, H_tilde)
     mean_s = s.mean()
+    mean_o = o.mean()
     cvar_s = cvar(s, q=cvar_q)
-    return mse + alpha * mean_s + beta * cvar_s
-
-
-def bsde_loss(Y_T, H_tilde):
-    """BSDE terminal loss: MSE(Y_N - H_tilde)."""
-    return ((Y_T - H_tilde) ** 2).mean()
-
-
-def elastic_net_penalty(model, l1=0.0, l2=1e-4):
-    """Elastic net regularization on weight tensors only.
-
-    Excludes biases, LayerNorm parameters, and BSDE Y0.
-    """
-    l1_reg = 0.0
-    l2_reg = 0.0
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        # Skip non-weight parameters
-        if "bias" in name:
-            continue
-        if "LayerNorm" in name or "layer_norm" in name:
-            continue
-        if name == "Y0":
-            continue
-        if "weight" in name:
-            l1_reg = l1_reg + param.abs().sum()
-            l2_reg = l2_reg + (param ** 2).sum()
-    return l1 * l1_reg + l2 * l2_reg
+    return lambda_short * mean_s + lambda_over * mean_o + lambda_short * cvar_s

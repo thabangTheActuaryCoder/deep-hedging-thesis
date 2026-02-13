@@ -1,9 +1,12 @@
-"""FNN baseline hedger (NN1).
+"""FNN hedger with cone (narrowing) architecture.
 
-Block structure: Linear -> LayerNorm -> Activation -> Dropout
-Processes each time step independently (parameter sharing across time).
+Cone structure: start_width -> start_width//2 -> ... -> min 4.
+Block structure: Linear -> LayerNorm -> CELU -> Dropout
+Output: 1 scalar (sigmoid allocation logit), identity output.
+Kaiming weight initialization.
 """
 import torch.nn as nn
+import torch.nn.init as init
 
 
 def get_activation(schedule, layer_idx):
@@ -19,28 +22,51 @@ def get_activation(schedule, layer_idx):
     raise ValueError(f"Unknown activation schedule: {schedule}")
 
 
+def cone_layer_widths(start_width, min_width=4):
+    """Compute cone layer widths: start_width -> start_width//2 -> ... -> min_width.
+
+    Example: start=64 -> [64, 32, 16, 8, 4]
+    """
+    widths = []
+    w = start_width
+    while w >= min_width:
+        widths.append(w)
+        w = w // 2
+    if not widths:
+        widths = [min_width]
+    return widths
+
+
 class FNNHedger(nn.Module):
-    """Feedforward baseline hedger.
+    """Feedforward hedger with cone (narrowing) architecture.
 
     Input: X_k features at a single time step
-    Output: Delta0_k hedge ratio in R^d_traded
+    Output: h_k scalar in R (sigmoid allocation logit)
+    Hidden layers use CELU activation. Output is identity (no activation).
     """
 
-    def __init__(self, input_dim, d_traded, depth=5, width=128,
-                 act_schedule="relu_all", dropout=0.1):
+    def __init__(self, input_dim, start_width=64, dropout=0.1):
         super().__init__()
+        widths = cone_layer_widths(start_width)
+
         layers = []
         in_dim = input_dim
-        for i in range(depth):
+        for i, width in enumerate(widths):
+            linear = nn.Linear(in_dim, width)
+            init.kaiming_uniform_(linear.weight, nonlinearity="relu")
+            init.zeros_(linear.bias)
             layers.extend([
-                nn.Linear(in_dim, width),
+                linear,
                 nn.LayerNorm(width),
-                get_activation(act_schedule, i),
+                nn.CELU(),
                 nn.Dropout(dropout),
             ])
             in_dim = width
         self.network = nn.Sequential(*layers)
-        self.output_head = nn.Linear(width, d_traded)
+
+        self.output_head = nn.Linear(in_dim, 1)
+        init.xavier_uniform_(self.output_head.weight)
+        init.zeros_(self.output_head.bias)
 
     def forward(self, x):
         """Forward pass.
@@ -49,12 +75,12 @@ class FNNHedger(nn.Module):
             x: [batch, feat_dim] single step or [batch, N, feat_dim] sequence
 
         Returns:
-            delta: [batch, d_traded] or [batch, N, d_traded]
+            h: [batch, 1] or [batch, N, 1] allocation logit
         """
         if x.dim() == 3:
             batch, N, feat = x.shape
             h = self.network(x.reshape(-1, feat))
-            delta = self.output_head(h)
-            return delta.reshape(batch, N, -1)
+            out = self.output_head(h)
+            return out.reshape(batch, N, 1)
         h = self.network(x)
         return self.output_head(h)

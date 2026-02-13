@@ -1,7 +1,8 @@
 """2D plotting functions for hedging diagnostics.
 
-Generates PNG plots inspired by Guo-Langrene-Wu (2023):
-loss curves, error histograms, CVaR curves, scatter plots, daily P/L, drawdown.
+Generates PNG plots for super-hedging analysis:
+loss curves, error histograms, CVaR curves, scatter plots, daily P/L, drawdown,
+super-hedging histogram.
 """
 import os
 import numpy as np
@@ -13,17 +14,16 @@ from src.training.losses import terminal_error, shortfall, cvar
 from src.utils.io import ensure_dir
 
 
-def generate_all_plots(model_name, seed, V_T, H_tilde, V_path, Z_intrinsic,
+def generate_all_plots(model_name, seed, V_T, H_tilde, V_path,
                        train_losses, val_losses, output_dir="outputs/plots"):
     """Generate all 2D diagnostic plots for a single model run.
 
     Args:
-        model_name: str, e.g. "FNN", "LSTM", "DBSDE"
+        model_name: str, e.g. "FNN", "GRU", "Regression"
         seed: int
         V_T: [n] terminal portfolio value
         H_tilde: [n] discounted payoff
         V_path: [n, N+1] portfolio value path
-        Z_intrinsic: [n, N+1] intrinsic process
         train_losses, val_losses: lists of per-epoch values
         output_dir: directory for saving plots
     """
@@ -35,35 +35,29 @@ def generate_all_plots(model_name, seed, V_T, H_tilde, V_path, Z_intrinsic,
     V_T_np = V_T.cpu().numpy()
     H_np = H_tilde.cpu().numpy()
 
-    # (1) Loss curves
-    plot_loss_curves(train_losses, val_losses, prefix, output_dir)
+    # (1) Loss curves (skip for Regression which has no iterative training)
+    if train_losses:
+        plot_loss_curves(train_losses, val_losses, prefix, output_dir)
 
     # (2) Terminal error histogram
     plot_histogram(e, f"{prefix} Terminal Error $e_T$",
                    "Terminal Error", f"{prefix}_error_hist.png", output_dir)
 
-    # (3) Shortfall histogram
-    plot_histogram(s[s > 0], f"{prefix} Shortfall $s$",
-                   "Shortfall", f"{prefix}_shortfall_hist.png", output_dir)
+    # (3) Super-hedging histogram
+    plot_superhedging_histogram(e, prefix, output_dir)
 
-    # (4) Overlay: terminal error vs intrinsic gap
-    if V_path is not None and Z_intrinsic is not None:
-        gap = (V_path - Z_intrinsic).cpu().numpy()
-        mean_gap = gap.mean(axis=1)
-        plot_overlay_hist(e, mean_gap, prefix, output_dir)
-
-    # (5) CVaR curve
+    # (4) CVaR curve
     plot_cvar_curve(V_T, H_tilde, prefix, output_dir)
 
-    # (6) Scatter: V_T vs H_tilde
+    # (5) Scatter: V_T vs H_tilde
     plot_scatter(V_T_np, H_np, prefix, output_dir)
 
-    # (7) Daily P/L
+    # (6) Daily P/L
     if V_path is not None:
         dPL = (V_path[:, 1:] - V_path[:, :-1]).cpu().numpy()
         plot_daily_pnl(dPL, prefix, output_dir)
 
-    # (8) Drawdown distribution
+    # (7) Drawdown distribution
     if V_path is not None:
         plot_drawdown(V_path, prefix, output_dir)
 
@@ -71,7 +65,7 @@ def generate_all_plots(model_name, seed, V_T, H_tilde, V_path, Z_intrinsic,
 
 
 def plot_loss_curves(train_losses, val_losses, prefix, output_dir):
-    """(1) Train vs validation loss curves."""
+    """Train vs validation loss curves."""
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(train_losses, label="Train Loss", linewidth=1.5)
     ax.plot(val_losses, label="Val CVaR95(shortfall)", linewidth=1.5)
@@ -100,23 +94,31 @@ def plot_histogram(data, title, xlabel, filename, output_dir, bins=60):
     plt.close(fig)
 
 
-def plot_overlay_hist(error, gap, prefix, output_dir):
-    """(4) Overlay histogram: terminal error vs mean intrinsic gap."""
+def plot_superhedging_histogram(errors, prefix, output_dir):
+    """Super-hedging histogram: e_T = V_T - H_tilde.
+
+    Shows the fraction of paths where V_T >= H_tilde (positive errors).
+    Goal: mass should be mostly on the positive side.
+    """
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.hist(error, bins=60, density=True, alpha=0.5, label="Terminal Error $e_T$")
-    ax.hist(gap, bins=60, density=True, alpha=0.5, label="Mean Intrinsic Gap")
-    ax.set_xlabel("Value")
+    ax.hist(errors, bins=80, density=True, alpha=0.7, edgecolor="black", linewidth=0.5)
+    ax.axvline(0, color="black", linestyle="-", linewidth=1.5, label="$V_T = H$")
+    frac_positive = (errors > 0).mean()
+    ax.axvline(np.mean(errors), color="red", linestyle="--",
+               label=f"Mean={np.mean(errors):.4f}")
+    ax.set_xlabel("$V_T - \\tilde{H}$")
     ax.set_ylabel("Density")
-    ax.set_title(f"{prefix}: Error vs Intrinsic Gap")
+    ax.set_title(f"{prefix}: Super-Hedging Error "
+                 f"($P(V_T \\geq H)$ = {frac_positive:.1%})")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, f"{prefix}_overlay_hist.png"), dpi=150)
+    fig.savefig(os.path.join(output_dir, f"{prefix}_superhedging_hist.png"), dpi=150)
     plt.close(fig)
 
 
 def plot_cvar_curve(V_T, H_tilde, prefix, output_dir):
-    """(5) CVaR curve: CVaR_q(shortfall) for q in [0.80, 0.99]."""
+    """CVaR curve: CVaR_q(shortfall) for q in [0.80, 0.99]."""
     s = shortfall(V_T, H_tilde)
     qs = np.linspace(0.80, 0.99, 20)
     cvars = [cvar(s, q=q).item() for q in qs]
@@ -138,7 +140,7 @@ def plot_cvar_curve(V_T, H_tilde, prefix, output_dir):
 
 
 def plot_scatter(V_T, H_tilde, prefix, output_dir):
-    """(6) Scatter: V_T vs H_tilde with 45-degree line."""
+    """Scatter: V_T vs H_tilde with 45-degree line."""
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.scatter(H_tilde, V_T, s=2, alpha=0.3)
     lo = min(H_tilde.min(), V_T.min())
@@ -155,7 +157,7 @@ def plot_scatter(V_T, H_tilde, prefix, output_dir):
 
 
 def plot_daily_pnl(dPL, prefix, output_dir):
-    """(7) Daily P/L: mean +/- 1 std band over time."""
+    """Daily P/L: mean +/- 1 std band over time."""
     mean_pnl = dPL.mean(axis=0)
     std_pnl = dPL.std(axis=0)
     steps = np.arange(len(mean_pnl))
@@ -176,7 +178,7 @@ def plot_daily_pnl(dPL, prefix, output_dir):
 
 
 def plot_drawdown(V_path, prefix, output_dir):
-    """(8) Max drawdown distribution."""
+    """Max drawdown distribution."""
     V_np = V_path.cpu().numpy()
     running_max = np.maximum.accumulate(V_np, axis=1)
     drawdown = (running_max - V_np).max(axis=1)
@@ -195,43 +197,13 @@ def plot_drawdown(V_path, prefix, output_dir):
     plt.close(fig)
 
 
-def plot_substeps_convergence(substeps_results, output_dir="outputs/plots"):
-    """(9) DBSDE substeps convergence plot.
-
-    Args:
-        substeps_results: list of dicts with keys 'substeps', 'val_MSE', 'val_CVaR95'
-    """
-    ensure_dir(output_dir)
-    subs = [r["substeps"] for r in substeps_results]
-    mses = [r["val_MSE"] for r in substeps_results]
-    cvars = [r["val_CVaR95"] for r in substeps_results]
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    axes[0].plot(subs, mses, "o-", linewidth=1.5)
-    axes[0].set_xlabel("Substeps")
-    axes[0].set_ylabel("Validation MSE")
-    axes[0].set_title("DBSDE: MSE vs Substeps")
-    axes[0].grid(True, alpha=0.3)
-
-    axes[1].plot(subs, cvars, "o-", linewidth=1.5, color="orange")
-    axes[1].set_xlabel("Substeps")
-    axes[1].set_ylabel("Validation CVaR95(shortfall)")
-    axes[1].set_title("DBSDE: CVaR95 vs Substeps")
-    axes[1].grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "substeps_convergence.png"), dpi=150)
-    plt.close(fig)
-
-
 def plot_summary_table(all_metrics, output_dir="outputs/plots",
                        title="Model Comparison (Validation Set)"):
     """Generate a summary comparison table as an image."""
     ensure_dir(output_dir)
     models = list(all_metrics.keys())
     metric_names = ["MAE", "MSE", "R2", "mean_shortfall",
-                    "CVaR95_shortfall", "P_negative_error"]
+                    "CVaR95_shortfall", "P_positive_error"]
 
     cell_text = []
     for model in models:
@@ -295,11 +267,7 @@ def plot_model_comparison_bars(all_agg, output_dir="outputs/plots_val"):
 
 
 def plot_model_comparison_errors(model_errors_dict, output_dir="outputs/plots_val"):
-    """Overlay terminal error histograms for all models on one plot.
-
-    Args:
-        model_errors_dict: {model_name: np.array of terminal errors}
-    """
+    """Overlay terminal error histograms for all models on one plot."""
     ensure_dir(output_dir)
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -320,12 +288,7 @@ def plot_model_comparison_errors(model_errors_dict, output_dir="outputs/plots_va
 
 def plot_model_comparison_cvar(model_VT_dict, model_H_dict,
                                output_dir="outputs/plots_val"):
-    """Overlay CVaR curves (q=0.80..0.99) for all models on one plot.
-
-    Args:
-        model_VT_dict: {model_name: V_T tensor}
-        model_H_dict:  {model_name: H_tilde tensor}
-    """
+    """Overlay CVaR curves for all models on one plot."""
     ensure_dir(output_dir)
     qs = np.linspace(0.80, 0.99, 20)
 
@@ -352,16 +315,11 @@ def plot_model_comparison_cvar(model_VT_dict, model_H_dict,
 
 
 def plot_validation_summary(all_agg, best_model, output_dir="outputs/plots_val"):
-    """Summary table with best model row highlighted in green.
-
-    Args:
-        all_agg: {model_name: aggregated metrics dict}
-        best_model: str, name of best model to highlight
-    """
+    """Summary table with best model row highlighted in green."""
     ensure_dir(output_dir)
     models = list(all_agg.keys())
     metric_names = ["MAE", "MSE", "R2", "mean_shortfall",
-                    "CVaR95_shortfall", "P_negative_error"]
+                    "CVaR95_shortfall", "P_positive_error"]
 
     cell_text = []
     for model in models:
@@ -382,10 +340,9 @@ def plot_validation_summary(all_agg, best_model, output_dir="outputs/plots_val")
     table.set_fontsize(9)
     table.scale(1.2, 1.4)
 
-    # Highlight best model row in green
     for i, model in enumerate(models):
         if model == best_model:
-            for j in range(len(metric_names) + 1):  # +1 for row label
+            for j in range(len(metric_names) + 1):
                 cell = table[i + 1, j - 1] if j > 0 else table[i + 1, -1]
                 cell.set_facecolor("#c8e6c9")
 
@@ -396,42 +353,33 @@ def plot_validation_summary(all_agg, best_model, output_dir="outputs/plots_val")
 
 
 def plot_optuna_validation_loss(trial_log, model_name, output_dir="outputs/plots_val"):
-    """Scatter plot of validation loss across Optuna hyperparameter configurations.
-
-    Shows each tried configuration as a dot, with dashed crosshairs
-    highlighting the best (lowest CVaR95) configuration.
-
-    Args:
-        trial_log: list of dicts with keys lr, act_schedule, depth, width, val_CVaR95
-        model_name: str, e.g. "FNN", "LSTM", "DBSDE"
-        output_dir: output directory
-    """
+    """Scatter plot of validation loss across Optuna hyperparameter configs."""
     ensure_dir(output_dir)
     if not trial_log:
         return
 
-    # Sort by val_CVaR95 for consistent ordering
     sorted_log = sorted(trial_log, key=lambda x: x["val_CVaR95"])
 
-    # Build x-axis labels: [lr, act_schedule, depth, width]
     labels = []
     vals = []
     for t in sorted_log:
-        label = f"[{t['lr']}, {t['act_schedule']}, {t['depth']}, {t['width']}]"
+        parts = []
+        for key in ["lr", "start_width", "act_schedule", "num_layers", "hidden_size"]:
+            if key in t:
+                parts.append(str(t[key]))
+        label = "[" + ", ".join(parts) + "]"
         labels.append(label)
         vals.append(t["val_CVaR95"])
 
     vals = np.array(vals)
     x = np.arange(len(vals))
 
-    # Best configuration
     best_idx = np.argmin(vals)
     best_val = vals[best_idx]
 
     fig, ax = plt.subplots(figsize=(max(8, len(vals) * 0.8), 6))
     ax.scatter(x, vals, s=40, color="blue", zorder=5)
 
-    # Dashed crosshairs at best
     ax.axhline(best_val, color="black", linestyle="--", linewidth=1, alpha=0.7)
     ax.axvline(best_idx, color="black", linestyle="--", linewidth=1, alpha=0.7)
 

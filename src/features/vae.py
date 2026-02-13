@@ -1,7 +1,7 @@
-"""Variational Autoencoder for per-path latent encoding.
+"""Variational Autoencoder for synthetic path generation.
 
-Trained only on training set paths to prevent leakage.
-Produces a fixed-size latent vector per path that captures path-level information.
+Trained on training set log-prices. Used to generate synthetic paths
+for data augmentation (not feature extraction).
 """
 import torch
 import torch.nn as nn
@@ -54,9 +54,9 @@ def vae_loss(recon, x, mu, logvar, beta=1.0):
     return recon_loss + beta * kl
 
 
-def train_vae(log_prices_train, latent_dim=16, epochs=50,
-              batch_size=256, lr=1e-3, device="cpu"):
-    """Train VAE on flattened training paths only.
+def train_path_vae(log_prices_train, latent_dim=16, epochs=50,
+                   batch_size=256, lr=1e-3, device="cpu"):
+    """Train VAE on flattened training paths.
 
     Args:
         log_prices_train: [n_train, N+1, d] log discounted prices (train set)
@@ -89,17 +89,47 @@ def train_vae(log_prices_train, latent_dim=16, epochs=50,
     return model
 
 
-def encode_paths(vae_model, log_prices, device="cpu"):
-    """Encode paths to per-path latent vectors using frozen encoder.
+def generate_synthetic_paths(vae_model, n_synthetic, seq_len, d, device="cpu"):
+    """Generate synthetic paths by sampling from the VAE prior.
 
     Args:
-        log_prices: [n_paths, N+1, d]
+        vae_model: trained VAE (frozen)
+        n_synthetic: number of synthetic paths to generate
+        seq_len: N+1 (sequence length)
+        d: number of assets (d_traded)
 
     Returns:
-        latent: [n_paths, latent_dim]
+        synthetic_log_prices: [n_synthetic, seq_len, d]
     """
-    n_paths, seq_len, d = log_prices.shape
-    flat = log_prices.reshape(n_paths, -1).to(device)
     with torch.no_grad():
-        mu, _ = vae_model.encode(flat)
-    return mu.cpu()
+        z = torch.randn(n_synthetic, vae_model.latent_dim, device=device)
+        flat = vae_model.decode(z)
+    return flat.reshape(n_synthetic, seq_len, d).cpu()
+
+
+def augment_training_data(S_tilde_train, vae_model, augment_ratio=0.5,
+                          device="cpu"):
+    """Augment training price paths with VAE-generated synthetic paths.
+
+    Args:
+        S_tilde_train: [n_train, N+1, d_traded] real discounted prices
+        vae_model: trained VAE
+        augment_ratio: fraction of synthetic paths relative to real (e.g. 0.5 = +50%)
+
+    Returns:
+        S_tilde_augmented: [n_train + n_synthetic, N+1, d_traded]
+    """
+    n_train, seq_len, d = S_tilde_train.shape
+    n_synthetic = int(n_train * augment_ratio)
+
+    if n_synthetic == 0:
+        return S_tilde_train
+
+    # Generate synthetic log-prices and convert to prices
+    log_prices_train = torch.log(S_tilde_train.clamp(min=1e-8))
+    synthetic_log = generate_synthetic_paths(
+        vae_model, n_synthetic, seq_len, d, device=device
+    )
+    synthetic_prices = torch.exp(synthetic_log)
+
+    return torch.cat([S_tilde_train, synthetic_prices], dim=0)

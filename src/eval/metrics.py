@@ -1,28 +1,27 @@
 """Evaluation metrics for hedging performance.
 
-Reports both terminal-value metrics and dynamic hedging diagnostics.
+Reports terminal-value metrics and super-hedging diagnostics.
 """
 import numpy as np
 import torch
-from src.training.losses import terminal_error, shortfall, cvar
+from src.training.losses import terminal_error, shortfall, over_hedge, cvar
 
 
-def compute_metrics(V_T, H_tilde, V_path=None, Z_intrinsic=None, cvar_q=0.95):
+def compute_metrics(V_T, H_tilde, V_path=None, cvar_q=0.95):
     """Compute full suite of hedging metrics.
 
     Args:
         V_T: [n] terminal portfolio value
         H_tilde: [n] discounted payoff
         V_path: [n, N+1] optional portfolio path (for daily P/L metrics)
-        Z_intrinsic: [n, N+1] optional intrinsic process
 
     Returns:
         metrics: dict of metric name -> value
     """
     e = terminal_error(V_T, H_tilde)
     s = shortfall(V_T, H_tilde)
+    o = over_hedge(V_T, H_tilde)
 
-    # Terminal metrics
     metrics = {
         "MAE": e.abs().mean().item(),
         "MSE": (e ** 2).mean().item(),
@@ -30,28 +29,21 @@ def compute_metrics(V_T, H_tilde, V_path=None, Z_intrinsic=None, cvar_q=0.95):
         "mean_error": e.mean().item(),
         "std_error": e.std().item(),
         "P_negative_error": (e < 0).float().mean().item(),
+        "P_positive_error": (e > 0).float().mean().item(),
         "mean_shortfall": s.mean().item(),
+        "mean_over_hedge": o.mean().item(),
         "CVaR90_shortfall": cvar(s, q=0.90).item(),
         "CVaR95_shortfall": cvar(s, q=0.95).item(),
         "CVaR99_shortfall": cvar(s, q=0.99).item(),
     }
 
-    # Intrinsic gap metrics
-    if V_path is not None and Z_intrinsic is not None:
-        gap = V_path - Z_intrinsic  # [n, N+1]
-        metrics["mean_intrinsic_gap"] = gap.mean().item()
-        metrics["P_negative_intrinsic_gap"] = (gap < 0).float().mean().item()
-
-    # Daily P/L metrics
     if V_path is not None:
-        dPL = V_path[:, 1:] - V_path[:, :-1]  # [n, N]
+        dPL = V_path[:, 1:] - V_path[:, :-1]
         metrics["mean_dPL"] = dPL.mean().item()
         metrics["std_dPL"] = dPL.std().item()
-        # Worst daily loss per path
-        worst_daily = dPL.min(dim=1)[0]  # [n]
+        worst_daily = dPL.min(dim=1)[0]
         metrics["mean_worst_daily_loss"] = worst_daily.mean().item()
         metrics["std_worst_daily_loss"] = worst_daily.std().item()
-        # Max drawdown
         running_max = torch.cummax(V_path, dim=1)[0]
         drawdown = (running_max - V_path).max(dim=1)[0]
         metrics["mean_max_drawdown"] = drawdown.mean().item()
@@ -88,7 +80,7 @@ def aggregate_seed_metrics(seed_metrics_list):
         mean = arr.mean()
         std = arr.std(ddof=1) if n > 1 else 0.0
         se = std / np.sqrt(n) if n > 1 else 0.0
-        t_val = 2.776 if n == 5 else 2.0  # approx t-crit for 95% CI
+        t_val = 2.776 if n == 5 else 2.0
         agg[key] = {
             "mean": float(mean),
             "std": float(std),
