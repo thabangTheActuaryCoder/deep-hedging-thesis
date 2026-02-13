@@ -358,7 +358,10 @@ def plot_optuna_validation_loss(trial_log, model_name, output_dir="outputs/plots
     if not trial_log:
         return
 
-    sorted_log = sorted(trial_log, key=lambda x: x["val_CVaR95"])
+    def _trial_val(t):
+        return t.get("val_MAE", t.get("val_CVaR95", float("inf")))
+
+    sorted_log = sorted(trial_log, key=_trial_val)
 
     labels = []
     vals = []
@@ -369,7 +372,7 @@ def plot_optuna_validation_loss(trial_log, model_name, output_dir="outputs/plots
                 parts.append(str(t[key]))
         label = "[" + ", ".join(parts) + "]"
         labels.append(label)
-        vals.append(t["val_CVaR95"])
+        vals.append(_trial_val(t))
 
     vals = np.array(vals)
     x = np.arange(len(vals))

@@ -75,7 +75,7 @@ def parse_args():
 
     # Architecture grid (FNN cone)
     p.add_argument("--start_width_grid", type=int, nargs="+", default=[16, 32, 64, 128])
-    p.add_argument("--lrs", type=float, nargs="+", default=[3e-4, 1e-3, 3e-3])
+    p.add_argument("--lrs", type=float, nargs="+", default=[1e-4])
 
     # GRU activation schedule
     p.add_argument("--act_schedules", type=str, nargs="+",
@@ -259,7 +259,6 @@ def run_optuna_search(model_class, feat_dim, d_traded,
             t_losses, v_losses = train_hedger(
                 model, t_data, v_data, train_cfg, device
             )
-            val_cvar = v_losses[-1] if v_losses else float("inf")
 
             with torch.no_grad():
                 model.eval()
@@ -268,9 +267,10 @@ def run_optuna_search(model_class, feat_dim, d_traded,
                     v_data["V_0"], d_traded,
                 )
                 e = terminal_error(V_T, v_data["H_tilde"])
+                val_mae = e.abs().mean().item()
                 val_mse = (e ** 2).mean().item()
 
-            return val_cvar, val_mse
+            return val_mae, val_mse
 
         finally:
             del model, t_data, v_data
@@ -292,22 +292,22 @@ def run_optuna_search(model_class, feat_dim, d_traded,
                             "act_schedule": act, "lr": lr}
 
         if config_key in _seen_configs:
-            val_cvar, val_mse = _seen_configs[config_key]
+            val_mae, val_mse = _seen_configs[config_key]
             trial.set_user_attr("val_MSE", val_mse)
             entry = dict(trial_params)
-            entry["val_CVaR95"] = val_cvar
+            entry["val_MAE"] = val_mae
             entry["val_MSE"] = val_mse
             trial_log.append(entry)
             print(f"    Trial {trial.number}: {trial_params} "
-                  f"-> CVaR95={val_cvar:.6f}  MSE={val_mse:.6f}  [cached]")
-            return val_cvar
+                  f"-> MAE={val_mae:.6f}  MSE={val_mse:.6f}  [cached]")
+            return val_mae
 
         batch_size = args.batch_size
         min_batch = max(64, args.batch_size // 16)
-        val_cvar, val_mse = float("inf"), float("inf")
+        val_mae, val_mse = float("inf"), float("inf")
         while batch_size >= min_batch:
             try:
-                val_cvar, val_mse = _run_trial_inner(trial_params, batch_size)
+                val_mae, val_mse = _run_trial_inner(trial_params, batch_size)
                 break
             except RuntimeError as ex:
                 if "out of memory" in str(ex).lower():
@@ -322,18 +322,18 @@ def run_optuna_search(model_class, feat_dim, d_traded,
                     clear_gpu_cache()
                     break
 
-        _seen_configs[config_key] = (val_cvar, val_mse)
+        _seen_configs[config_key] = (val_mae, val_mse)
         trial.set_user_attr("val_MSE", val_mse)
 
         entry = dict(trial_params)
-        entry["val_CVaR95"] = val_cvar
+        entry["val_MAE"] = val_mae
         entry["val_MSE"] = val_mse
         trial_log.append(entry)
 
         print(f"    Trial {trial.number}: {trial_params} "
-              f"-> CVaR95={val_cvar:.6f}  MSE={val_mse:.6f}")
+              f"-> MAE={val_mae:.6f}  MSE={val_mse:.6f}")
 
-        return val_cvar
+        return val_mae
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -373,7 +373,7 @@ def run_optuna_search(model_class, feat_dim, d_traded,
                     key = (t.params["num_layers"], t.params["hidden_size"],
                            t.params["act_schedule"], t.params["lr"])
                 mse = t.user_attrs.get("val_MSE", float("inf"))
-                _seen_configs[key] = (t.value, mse)
+                _seen_configs[key] = (t.value, mse)  # t.value = MAE
     if remaining > 0:
         study.optimize(objective, n_trials=remaining, show_progress_bar=False)
 
@@ -382,11 +382,11 @@ def run_optuna_search(model_class, feat_dim, d_traded,
     for t in study.trials:
         if t.state == optuna.trial.TrialState.COMPLETE:
             entry = dict(t.params)
-            entry["val_CVaR95"] = t.value
+            entry["val_MAE"] = t.value  # objective = MAE
             entry["val_MSE"] = t.user_attrs.get("val_MSE", float("inf"))
             trial_log.append(entry)
 
-    trial_log.sort(key=lambda x: (x["val_CVaR95"], x["val_MSE"], x["lr"]))
+    trial_log.sort(key=lambda x: (x["val_MAE"], x["val_MSE"]))
     best = trial_log[0]
 
     print(f"\n  Best {model_class}: {best}")
@@ -484,7 +484,7 @@ def run_seed_robustness(model_class, best_config, feat_dim, d_traded,
                 output_dir=os.path.join(args.output_dir, "plots_3d"),
             )
 
-        print(f"CVaR95(val)={val_metrics['CVaR95_shortfall']:.6f}")
+        print(f"MAE(val)={val_metrics['MAE']:.6f}  MSE(val)={val_metrics['MSE']:.6f}")
 
         seed_results.append({
             "seed": seed,
@@ -545,7 +545,8 @@ def run_regression_eval(feat_dim, d_traded, reg_train_data,
         output_dir=os.path.join(args.output_dir, "plots_3d"),
     )
 
-    print(f"  Regression: CVaR95={val_metrics['CVaR95_shortfall']:.6f}  "
+    print(f"  Regression: MAE={val_metrics['MAE']:.6f}  "
+          f"MSE={val_metrics['MSE']:.6f}  "
           f"P(V_T>=H)={val_metrics['P_positive_error']:.1%}")
 
     # Wrap in aggregated format (single seed)
