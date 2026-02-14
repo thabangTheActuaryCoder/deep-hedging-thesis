@@ -1,11 +1,21 @@
 {
-  "source": "S&P 500 / CBOE VIX, Jan 2026",
-  "note": "Calibrated parameters for deep hedging experiments",
+  "source": "Apple (AAPL) + Microsoft (MSFT), 31 Dec 2019 - 31 Dec 2025",
+  "note": "Calibrated from daily close prices via realized volatility and method of moments",
+  "dataset": "Dataset/MSc MS dataset.xlsx",
+  "traded_assets": [
+    "AAPL",
+    "MSFT"
+  ],
+  "date_range": "2019-12-31 to 2025-12-31",
+  "n_observations": 1509,
   "paths": 100000,
   "gbm": {
     "r": 0.043,
-    "vols": [0.18, 0.22],
-    "extra_vol": 0.06,
+    "vols": [
+      0.3173,
+      0.2954
+    ],
+    "extra_vol": 0.1644,
     "K": 1.0,
     "T": 1.0
   },
@@ -13,10 +23,25 @@
     "r": 0.043,
     "K": 1.0,
     "T": 1.0,
-    "kappa": [2.0, 2.0],
-    "theta": [0.04, 0.05],
-    "xi": [0.3, 0.35],
-    "rho": [-0.7, -0.65],
-    "v0": [0.04, 0.05]
+    "kappa": [
+      2.43,
+      2.1
+    ],
+    "theta": [
+      0.1018,
+      0.0882
+    ],
+    "xi": [
+      0.7,
+      0.62
+    ],
+    "rho": [
+      -0.1,
+      -0.1
+    ],
+    "v0": [
+      0.0117,
+      0.0293
+    ]
   }
 }
