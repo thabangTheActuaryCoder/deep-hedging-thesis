@@ -24,7 +24,8 @@ import optuna
 
 from src.utils.config import ExperimentConfig
 from src.utils.reproducibility import set_seed, get_device, clear_gpu_cache
-from src.utils.io import save_json, load_json, save_checkpoint, ensure_dir, compute_split_hash
+from src.utils.io import (save_json, load_json, save_checkpoint, load_checkpoint,
+                          ensure_dir, compute_split_hash, save_tensor, load_tensor)
 from src.sim.simulate_market import (
     simulate_market, compute_european_put_payoff,
     compute_intrinsic_process, split_data,
@@ -70,6 +71,8 @@ def parse_args():
     p.add_argument("--market_config", type=str, default="")
     p.add_argument("--market_model", type=str, default="both",
                    choices=["gbm", "heston", "both"])
+    p.add_argument("--models", type=str, nargs="+", default=["all"],
+                   choices=["fnn", "gru", "regression", "all"])
 
     # Features
     p.add_argument("--latent_dim", type=int, default=16)
@@ -585,8 +588,8 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
                  split_hash, vols, market_label="gbm"):
     """Run the full training pipeline for a given market model."""
     output_dir = os.path.join(args.output_dir, market_label)
-    for sub in ["plots", "plots_val", "plots_3d", "checkpoints", "run_configs",
-                "data"]:
+    for sub in ["plots", "plots_val", "plots_test", "plots_3d", "checkpoints",
+                "run_configs", "data"]:
         ensure_dir(os.path.join(output_dir, sub))
 
     d_traded = args.d_traded
@@ -635,9 +638,11 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
     # Compute V_0 (BS price)
     sigma_avg_scalar = vols[0]  # first asset vol for BS price
     V_0_val = get_V0(S_tilde_val, args.K, args.r, args.T, sigma_avg_scalar, len(val_idx))
+    V_0_test = get_V0(S_tilde_test, args.K, args.r, args.T, sigma_avg_scalar, len(test_idx))
     V_0_train = get_V0(S_tilde_aug, args.K, args.r, args.T, sigma_avg_scalar, n_aug)
 
-    all_models = ["FNN", "GRU", "Regression"]
+    all_models = [m for m in ["FNN", "GRU", "Regression"]
+                  if m in getattr(args, 'models_to_run', ["FNN", "GRU", "Regression"])]
 
     # ── Build features per model type ──
     print(f"\n=== Feature Construction ===")
@@ -698,7 +703,7 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
         best_configs = stage1_saved.get("best_configs", {})
         trial_logs = stage1_saved.get("trial_logs", {})
 
-    for model_class in ["FNN", "GRU"]:
+    for model_class in [m for m in ["FNN", "GRU"] if m in all_models]:
         if model_class in best_configs:
             bc = best_configs[model_class]
             print(f"\n--- {model_class} [cached] ---")
@@ -751,7 +756,7 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
     all_agg = {}
     all_comparison = {}
 
-    for model_class in ["FNN", "GRU"]:
+    for model_class in [m for m in ["FNN", "GRU"] if m in all_models]:
         print(f"\n--- {model_class} ---")
         mf = model_features[model_class]
         feat_dim = mf["feat_dim"]
@@ -773,32 +778,58 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
         all_agg[model_class] = agg
         all_comparison[model_class] = comp_data
 
+        # Save terminal data for cross-run loading
+        save_tensor(comp_data["V_T"], os.path.join(output_dir, "data", f"{model_class}_V_T.pt"))
+        save_tensor(comp_data["H_tilde"], os.path.join(output_dir, "data", f"{model_class}_H_tilde.pt"))
+
         clear_gpu_cache()
 
     # ── Regression (no HP search, no seed robustness) ──
-    print(f"\n=== Regression (OLS) ===")
-    mf = model_features["Regression"]
-    feat_dim = mf["feat_dim"]
+    if "Regression" in all_models:
+        print(f"\n=== Regression (OLS) ===")
+        mf = model_features["Regression"]
+        feat_dim = mf["feat_dim"]
 
-    hedger_val_reg = prepare_hedger_data(
-        mf["val"], S_tilde_val, H_val, V_0_val, device
-    )
+        hedger_val_reg = prepare_hedger_data(
+            mf["val"], S_tilde_val, H_val, V_0_val, device
+        )
 
-    reg_train_data = prepare_regression_data(
-        mf["train"], S_tilde_aug, args.K, args.r, args.T,
-        time_grid, vols, device,
-    )
+        reg_train_data = prepare_regression_data(
+            mf["train"], S_tilde_aug, args.K, args.r, args.T,
+            time_grid, vols, device,
+        )
 
-    reg_agg, reg_comp = run_regression_eval(
-        feat_dim, d_traded, reg_train_data,
-        hedger_val_reg, args, device,
-        S_tilde_val, time_grid,
-    )
-    all_agg["Regression"] = reg_agg
-    all_comparison["Regression"] = reg_comp
+        reg_agg, reg_comp = run_regression_eval(
+            feat_dim, d_traded, reg_train_data,
+            hedger_val_reg, args, device,
+            S_tilde_val, time_grid,
+        )
+        all_agg["Regression"] = reg_agg
+        all_comparison["Regression"] = reg_comp
+
+        # Save terminal data for cross-run loading
+        save_tensor(reg_comp["V_T"], os.path.join(output_dir, "data", "Regression_V_T.pt"))
+        save_tensor(reg_comp["H_tilde"], os.path.join(output_dir, "data", "Regression_H_tilde.pt"))
+
+        clear_gpu_cache()
 
     # Restore original output_dir
     args.output_dir = orig_output_dir
+
+    # ── Load saved results from prior runs for comparison ──
+    for mc in ["FNN", "GRU", "Regression"]:
+        if mc not in all_agg:
+            metric_path = os.path.join(output_dir, "run_configs", f"{mc}_seed0_metrics.json")
+            vt_path = os.path.join(output_dir, "data", f"{mc}_V_T.pt")
+            ht_path = os.path.join(output_dir, "data", f"{mc}_H_tilde.pt")
+            if os.path.exists(metric_path) and os.path.exists(vt_path):
+                all_agg[mc] = aggregate_seed_metrics([load_json(metric_path)])
+                all_agg[mc]["representative_seed"] = 0
+                all_comparison[mc] = {
+                    "V_T": load_tensor(vt_path),
+                    "H_tilde": load_tensor(ht_path),
+                }
+                print(f"  Loaded saved results for {mc} from prior run")
 
     # ── Validation Analysis ──
     print(f"\n=== Validation Analysis ===")
@@ -834,12 +865,151 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
         plot_model_comparison_cvar(model_VT_dict, model_H_dict,
                                    output_dir=plots_val_dir)
 
+    # ── Test-Set Evaluation ──
+    print(f"\n=== Test-Set Evaluation ===")
+
+    plots_test_dir = os.path.join(output_dir, "plots_test")
+    test_agg = {}
+    test_comparison = {}
+
+    for mc in list(all_agg.keys()):
+        rep_seed = all_agg[mc].get("representative_seed", 0)
+        ckpt_path = os.path.join(output_dir, "checkpoints",
+                                 f"{mc}_seed{rep_seed}.pt")
+        test_metric_path = os.path.join(output_dir, "run_configs",
+                                        f"{mc}_seed{rep_seed}_test_metrics.json")
+
+        if not os.path.exists(ckpt_path):
+            print(f"  {mc}: no checkpoint found, skipping test eval")
+            continue
+
+        # Check cache
+        if os.path.exists(test_metric_path):
+            test_metrics = load_json(test_metric_path)
+            print(f"  {mc}: test MAE={test_metrics['MAE']:.6f}  "
+                  f"MSE={test_metrics['MSE']:.6f}  [cached]")
+            test_agg[mc] = aggregate_seed_metrics([test_metrics])
+            test_agg[mc]["representative_seed"] = rep_seed
+            vt_test_path = os.path.join(output_dir, "data", f"{mc}_test_V_T.pt")
+            ht_test_path = os.path.join(output_dir, "data", f"{mc}_test_H_tilde.pt")
+            if os.path.exists(vt_test_path):
+                test_comparison[mc] = {
+                    "V_T": load_tensor(vt_test_path),
+                    "H_tilde": load_tensor(ht_test_path),
+                }
+            continue
+
+        mf = model_features.get(mc)
+        if mf is None:
+            continue
+        feat_dim = mf["feat_dim"]
+
+        hedger_test = prepare_hedger_data(
+            mf["test"], S_tilde_test, H_test, V_0_test, device
+        )
+
+        if mc == "FNN":
+            bc = best_configs.get(mc, {})
+            model = make_fnn(feat_dim, bc["start_width"],
+                             bc.get("dropout", 0.1), device)
+        elif mc == "GRU":
+            bc = best_configs.get(mc, {})
+            model = make_gru(feat_dim, bc["num_layers"], bc["hidden_size"],
+                             bc["act_schedule"], bc.get("dropout", 0.1),
+                             device, d_traded=d_traded)
+        elif mc == "Regression":
+            model = make_regression(feat_dim, d_traded, device)
+        else:
+            continue
+
+        state_dict = load_checkpoint(ckpt_path, device=str(device))
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        with torch.no_grad():
+            V_T_test, V_path_test = forward_portfolio(
+                model, hedger_test["features"], hedger_test["S_tilde"],
+                hedger_test["V_0"], d_traded,
+            )
+        test_metrics = compute_metrics(V_T_test, hedger_test["H_tilde"],
+                                       V_path=V_path_test)
+        save_json(test_metrics, test_metric_path)
+
+        generate_all_plots(
+            mc, rep_seed, V_T_test.cpu(), hedger_test["H_tilde"].cpu(),
+            V_path_test.cpu(), [], [],
+            output_dir=plots_test_dir,
+        )
+
+        save_tensor(V_T_test.cpu(), os.path.join(output_dir, "data", f"{mc}_test_V_T.pt"))
+        save_tensor(hedger_test["H_tilde"].cpu(), os.path.join(output_dir, "data", f"{mc}_test_H_tilde.pt"))
+
+        print(f"  {mc}: test MAE={test_metrics['MAE']:.6f}  "
+              f"MSE={test_metrics['MSE']:.6f}  "
+              f"P(V_T>=H)={test_metrics['P_positive_error']:.1%}")
+
+        test_agg[mc] = aggregate_seed_metrics([test_metrics])
+        test_agg[mc]["representative_seed"] = rep_seed
+        test_comparison[mc] = {
+            "V_T": V_T_test.cpu(),
+            "H_tilde": hedger_test["H_tilde"].cpu(),
+        }
+
+        del model, hedger_test
+        clear_gpu_cache()
+
+    # Load test results from prior runs for models not in current run
+    for mc in ["FNN", "GRU", "Regression"]:
+        if mc not in test_agg:
+            test_metric_path = os.path.join(output_dir, "run_configs",
+                                            f"{mc}_seed0_test_metrics.json")
+            vt_test_path = os.path.join(output_dir, "data", f"{mc}_test_V_T.pt")
+            ht_test_path = os.path.join(output_dir, "data", f"{mc}_test_H_tilde.pt")
+            if os.path.exists(test_metric_path) and os.path.exists(vt_test_path):
+                test_agg[mc] = aggregate_seed_metrics([load_json(test_metric_path)])
+                test_agg[mc]["representative_seed"] = 0
+                test_comparison[mc] = {
+                    "V_T": load_tensor(vt_test_path),
+                    "H_tilde": load_tensor(ht_test_path),
+                }
+                print(f"  Loaded saved test results for {mc} from prior run")
+
+    # Test-set comparison plots
+    if test_agg:
+        test_best = min(test_agg.keys(), key=lambda m: (
+            test_agg[m]["MAE"]["mean"] if isinstance(test_agg[m].get("MAE"), dict) else float("inf"),
+            test_agg[m]["MSE"]["mean"] if isinstance(test_agg[m].get("MSE"), dict) else float("inf"),
+        ))
+        print(f"\n  Best model (test): {test_best}")
+
+        plot_summary_table(test_agg, output_dir=plots_test_dir,
+                           title=f"Model Comparison – {market_label.upper()} (Test Set)")
+        plot_validation_summary(test_agg, test_best, output_dir=plots_test_dir)
+        plot_model_comparison_bars(test_agg, output_dir=plots_test_dir)
+
+        if test_comparison:
+            test_errors_dict = {}
+            test_VT_dict = {}
+            test_H_dict = {}
+            for mc, comp in test_comparison.items():
+                V_T_c = comp["V_T"]
+                H_c = comp["H_tilde"]
+                e = terminal_error(V_T_c, H_c).numpy()
+                test_errors_dict[mc] = e
+                test_VT_dict[mc] = V_T_c
+                test_H_dict[mc] = H_c
+            plot_model_comparison_errors(test_errors_dict, output_dir=plots_test_dir)
+            plot_model_comparison_cvar(test_VT_dict, test_H_dict,
+                                       output_dir=plots_test_dir)
+
     # Save results
     summary_path = os.path.join(output_dir, "metrics_summary.json")
     summary = {
         "best_configs": best_configs,
         "aggregated_val_metrics": all_agg,
-        "best_model": best_model,
+        "aggregated_test_metrics": test_agg,
+        "best_model_val": best_model,
+        "best_model_test": test_best if test_agg else best_model,
         "market_model": market_label,
         "config": {
             "paths": args.paths, "N": args.N, "T": args.T,
@@ -850,6 +1020,7 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
     }
     save_json(summary, summary_path)
     _write_csv_summary(all_agg, os.path.join(output_dir, "val_metrics_summary.csv"))
+    _write_csv_summary(test_agg, os.path.join(output_dir, "test_metrics_summary.csv"))
 
     print(f"\n  Done. Results saved to {output_dir}/")
     return all_agg, all_comparison
@@ -857,9 +1028,17 @@ def run_pipeline(args, device, S_tilde, dW, time_grid, sigma,
 
 def main():
     args = parse_args()
+
+    if "all" in args.models:
+        args.models_to_run = ["FNN", "GRU", "Regression"]
+    else:
+        _map = {"fnn": "FNN", "gru": "GRU", "regression": "Regression"}
+        args.models_to_run = [_map[m.lower()] for m in args.models]
+
     device = get_device()
     print(f"Device: {device}")
     print(f"Quick mode: {args.quick}")
+    print(f"Models: {args.models_to_run}")
 
     args.output_dir = "outputs"
     ensure_dir(args.output_dir)
