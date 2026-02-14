@@ -6,18 +6,19 @@ Strictly causal: features at time k use only data up to and including time k.
 import torch
 
 
-def compute_signature_features(log_prices, level=2):
+def compute_signature_features(log_prices, level=3):
     """Compute signature-like features up to given truncation level.
 
     Level 1: cumulative sums of increments (d features).
     Level 2: cumulative iterated integrals of pairwise products (d*(d+1)/2 features).
+    Level 3: cumulative triple iterated integrals (C(d+2,3) features).
 
     NO LOOK-AHEAD: increment at time k is log_prices_k - log_prices_{k-1}.
     At time k=0, all features are zero.
 
     Args:
         log_prices: [n_paths, N+1, d] log of discounted prices
-        level: truncation level (1 or 2)
+        level: truncation level (1, 2, or 3)
 
     Returns:
         sig_features: [n_paths, N+1, sig_dim]
@@ -47,12 +48,38 @@ def compute_signature_features(log_prices, level=2):
         level2_tensor = torch.stack(level2_features, dim=2)
         features.append(level2_tensor)
 
+    if level >= 3:
+        # Level 3: triple iterated integrals
+        # S3^{a,b,c}_k = sum_{j=1}^{k} S2^{a,b}_{j-1} * inc_j^c  for a <= b <= c
+        # Build index map for level2_features list: (a,b) -> index
+        l2_index = {}
+        idx = 0
+        for a in range(d):
+            for b in range(a, d):
+                l2_index[(a, b)] = idx
+                idx += 1
+
+        level3_features = []
+        for a in range(d):
+            for b in range(a, d):
+                for c in range(b, d):
+                    s2_ab = level2_features[l2_index[(a, b)]]
+                    shifted_s2 = torch.zeros_like(s2_ab)
+                    shifted_s2[:, 1:] = s2_ab[:, :-1]
+                    product = shifted_s2 * increments[:, :, c]
+                    level3 = torch.cumsum(product, dim=1)
+                    level3_features.append(level3)
+        level3_tensor = torch.stack(level3_features, dim=2)
+        features.append(level3_tensor)
+
     return torch.cat(features, dim=2)
 
 
-def get_signature_dim(d, level=2):
+def get_signature_dim(d, level=3):
     """Compute output dimension of signature features."""
     dim = d  # level 1
     if level >= 2:
         dim += d * (d + 1) // 2  # level 2 upper triangular pairs
+    if level >= 3:
+        dim += (d + 2) * (d + 1) * d // 6  # level 3 upper triangular triples
     return dim

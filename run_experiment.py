@@ -73,12 +73,14 @@ def parse_args():
 
     # Features
     p.add_argument("--latent_dim", type=int, default=16)
-    p.add_argument("--sig_level", type=int, default=2)
+    p.add_argument("--sig_level", type=int, default=3)
     p.add_argument("--vae_augment_ratio", type=float, default=0.5)
 
     # Architecture grid (FNN cone)
     p.add_argument("--start_width_grid", type=int, nargs="+", default=[16, 32, 64, 128])
-    p.add_argument("--lrs", type=float, nargs="+", default=[1e-4])
+    p.add_argument("--lrs", type=float, nargs="+", default=[1e-4, 5e-4, 1e-3])
+    p.add_argument("--dropout_grid", type=float, nargs="+",
+                   default=[0.0, 0.05, 0.1, 0.2, 0.3])
 
     # GRU activation schedule
     p.add_argument("--act_schedules", type=str, nargs="+",
@@ -100,7 +102,7 @@ def parse_args():
 
     # Seeds
     p.add_argument("--seed_arch", type=int, default=0)
-    p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
+    p.add_argument("--seeds", type=int, nargs="+", default=[0])
 
     # Optuna HP search
     p.add_argument("--n_trials", type=int, default=60)
@@ -117,6 +119,8 @@ def parse_args():
         args.seeds = [0]
         args.n_trials = 3
         args.start_width_grid = [16, 32]
+        args.lrs = [1e-4, 1e-3]
+        args.dropout_grid = [0.1, 0.2]
         args.gru_num_layers_grid = [1, 2]
         args.gru_hidden_size_grid = [32, 64]
         args.batch_size = 1024
@@ -252,11 +256,12 @@ def run_optuna_search(model_class, feat_dim, d_traded,
         try:
             if model_class == "FNN":
                 model = make_fnn(feat_dim, trial_params["start_width"],
-                                 0.1, device)
+                                 trial_params["dropout"], device)
             else:  # GRU
                 model = make_gru(feat_dim, trial_params["num_layers"],
                                  trial_params["hidden_size"],
-                                 trial_params["act_schedule"], 0.1, device,
+                                 trial_params["act_schedule"],
+                                 trial_params["dropout"], device,
                                  d_traded=d_traded)
 
             t_losses, v_losses = train_hedger(
@@ -283,16 +288,18 @@ def run_optuna_search(model_class, feat_dim, d_traded,
         if model_class == "FNN":
             start_width = trial.suggest_categorical("start_width", args.start_width_grid)
             lr = trial.suggest_categorical("lr", args.lrs)
-            config_key = (start_width, lr)
-            trial_params = {"start_width": start_width, "lr": lr}
+            dropout = trial.suggest_categorical("dropout", args.dropout_grid)
+            config_key = (start_width, lr, dropout)
+            trial_params = {"start_width": start_width, "lr": lr, "dropout": dropout}
         else:  # GRU
             num_layers = trial.suggest_categorical("num_layers", args.gru_num_layers_grid)
             hidden_size = trial.suggest_categorical("hidden_size", args.gru_hidden_size_grid)
             act = trial.suggest_categorical("act_schedule", args.act_schedules)
             lr = trial.suggest_categorical("lr", args.lrs)
-            config_key = (num_layers, hidden_size, act, lr)
+            dropout = trial.suggest_categorical("dropout", args.dropout_grid)
+            config_key = (num_layers, hidden_size, act, lr, dropout)
             trial_params = {"num_layers": num_layers, "hidden_size": hidden_size,
-                            "act_schedule": act, "lr": lr}
+                            "act_schedule": act, "lr": lr, "dropout": dropout}
 
         if config_key in _seen_configs:
             val_mae, val_mse = _seen_configs[config_key]
@@ -341,10 +348,12 @@ def run_optuna_search(model_class, feat_dim, d_traded,
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     if model_class == "FNN":
-        total_configs = len(args.start_width_grid) * len(args.lrs)
+        total_configs = (len(args.start_width_grid) * len(args.lrs)
+                         * len(args.dropout_grid))
     else:
         total_configs = (len(args.gru_num_layers_grid) * len(args.gru_hidden_size_grid)
-                         * len(args.act_schedules) * len(args.lrs))
+                         * len(args.act_schedules) * len(args.lrs)
+                         * len(args.dropout_grid))
 
     n_trials = min(args.n_trials, total_configs)
 
@@ -371,10 +380,12 @@ def run_optuna_search(model_class, feat_dim, d_traded,
         for t in study.trials:
             if t.state == optuna.trial.TrialState.COMPLETE:
                 if model_class == "FNN":
-                    key = (t.params["start_width"], t.params["lr"])
+                    key = (t.params["start_width"], t.params["lr"],
+                           t.params.get("dropout", 0.1))
                 else:
                     key = (t.params["num_layers"], t.params["hidden_size"],
-                           t.params["act_schedule"], t.params["lr"])
+                           t.params["act_schedule"], t.params["lr"],
+                           t.params.get("dropout", 0.1))
                 mse = t.user_attrs.get("val_MSE", float("inf"))
                 _seen_configs[key] = (t.value, mse)  # t.value = MAE
     if remaining > 0:
@@ -446,11 +457,12 @@ def run_seed_robustness(model_class, best_config, feat_dim, d_traded,
 
         if model_class == "FNN":
             model = make_fnn(feat_dim, best_config["start_width"],
-                             0.1, device)
+                             best_config.get("dropout", 0.1), device)
         elif model_class == "GRU":
             model = make_gru(feat_dim, best_config["num_layers"],
                              best_config["hidden_size"],
-                             best_config["act_schedule"], 0.1, device,
+                             best_config["act_schedule"],
+                             best_config.get("dropout", 0.1), device,
                              d_traded=d_traded)
         else:
             raise ValueError(f"Unexpected model_class for seed robustness: {model_class}")

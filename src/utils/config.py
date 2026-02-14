@@ -18,13 +18,14 @@ class ExperimentConfig:
 
     # Features
     latent_dim: int = 16
-    sig_level: int = 2
+    sig_level: int = 3
     vae_epochs: int = 50
     vae_augment_ratio: float = 0.5
 
     # Architecture grid (FNN cone)
     start_width_grid: List[int] = field(default_factory=lambda: [16, 32, 64, 128])
-    lrs: List[float] = field(default_factory=lambda: [3e-4, 1e-3, 3e-3])
+    lrs: List[float] = field(default_factory=lambda: [1e-4, 5e-4, 1e-3])
+    dropout_grid: List[float] = field(default_factory=lambda: [0.0, 0.05, 0.1, 0.2, 0.3])
 
     # Training
     epochs: int = 1000
@@ -39,7 +40,7 @@ class ExperimentConfig:
 
     # Seeds
     seed_arch: int = 0
-    seeds: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
+    seeds: List[int] = field(default_factory=lambda: [0])
 
     # Market model
     market_model: str = "gbm"

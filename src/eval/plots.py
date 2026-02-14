@@ -367,7 +367,7 @@ def plot_optuna_validation_loss(trial_log, model_name, output_dir="outputs/plots
     vals = []
     for t in sorted_log:
         parts = []
-        for key in ["lr", "start_width", "act_schedule", "num_layers", "hidden_size"]:
+        for key in ["lr", "start_width", "dropout", "act_schedule", "num_layers", "hidden_size"]:
             if key in t:
                 parts.append(str(t[key]))
         label = "[" + ", ".join(parts) + "]"
